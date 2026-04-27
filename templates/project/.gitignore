@@ -1,0 +1,10 @@
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets/
+.venv/
+__pycache__/
+.DS_Store
+.claude/settings.local.json

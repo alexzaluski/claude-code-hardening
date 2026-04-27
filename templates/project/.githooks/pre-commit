@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Block commits containing known secret / token patterns.
+# Activate once per project: git config core.hooksPath .githooks
+# (the setting lives in .git/config and isn't tracked in the repo)
+# Add patterns to the array below as needed.
+set -euo pipefail
+
+patterns=(
+  # Common token classes — uncomment any that apply to this project.
+  # The right list is whatever this project's data would expose if
+  # committed by accident.
+  # 'AKIA[0-9A-Z]{16}'                                       # AWS access-key IDs
+  # 'ghp_[A-Za-z0-9]{36}'                                    # GitHub personal access tokens
+  # 'github_pat_[A-Za-z0-9_]{82}'                            # GitHub fine-grained PATs
+  # 'xox[baprs]-[A-Za-z0-9-]+'                               # Slack tokens
+  # 'sk_live_[A-Za-z0-9]+'                                   # Stripe live keys
+  # 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'   # JWTs
+  # 'sk-[A-Za-z0-9]{32,}'                                    # OpenAI-style API keys
+  # 'EAA[A-Za-z0-9]{20,}'                                    # Meta archive tokens
+  # Add project-specific patterns here (internal IDs, vendor formats, etc.)
+)
+
+[ ${#patterns[@]} -eq 0 ] && exit 0  # No patterns configured — allow.
+
+violations=0
+for pat in "${patterns[@]}"; do
+  hits=$(git diff --cached -U0 --no-color --diff-filter=ACM \
+           | grep -E '^\+' | grep -v '^\+\+\+' \
+           | grep -E "$pat" | head -5 || true)
+  if [ -n "$hits" ]; then
+    echo "pre-commit BLOCKED: staged content matches: $pat" >&2
+    printf '%s\n' "$hits" >&2
+    violations=1
+  fi
+done
+
+[ "$violations" -eq 0 ] || exit 1
+exit 0

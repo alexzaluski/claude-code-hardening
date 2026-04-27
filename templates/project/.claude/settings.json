@@ -1,0 +1,61 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(nc:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(rsync:*)",
+      "Bash(git push:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(rm -rf /:*)",
+      "Bash(rm -rf ~/:*)",
+      "Bash(printenv:*)",
+      "Bash(env)",
+      "WebFetch",
+      "WebSearch",
+      "Read(./.env*)",
+      "Read(./**/.env*)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.key)",
+      "Read(../**)",
+      "Read(~/**)",
+
+      "Write(~/.claude/**)",
+      "Edit(~/.claude/**)",
+      "NotebookEdit(~/.claude/**)",
+      "Write(/tmp/**)",
+      "Edit(/tmp/**)",
+      "NotebookEdit(/tmp/**)",
+      "Write(/private/tmp/**)",
+      "Edit(/private/tmp/**)",
+      "NotebookEdit(/private/tmp/**)",
+      "Write(/var/tmp/**)",
+      "Edit(/var/tmp/**)",
+      "NotebookEdit(/var/tmp/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/deny-outside-project.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/deny-bash-outside-project.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
