@@ -3,6 +3,11 @@
 *.pem
 *.key
 *.p12
+*.pfx
+*.asc
+*.gpg
+id_rsa*
+id_ed25519*
 secrets/
 .venv/
 __pycache__/

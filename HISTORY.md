@@ -241,7 +241,35 @@ Lesson: heuristic security code needs to be tested against the case it claims to
 
 **Propagation (applies to both patches):** copy into (a) the scaffold script (the heredoc that emits the hook for new projects), and (b) every existing project that already has the older hook. `find <projects-root> -name deny-bash-outside-project.sh` lists candidates. Restart Claude in each project after copying — hooks register per-session.
 
-### Phase 10 — Where things stand now
+### Phase 11 — Audit follow-up: Bash hook bypass + deny-list breadth
+
+A second-pass review of the deployed setup turned up four issues, one a real bypass and three breadth gaps.
+
+**Bypass: no-whitespace shell operators slipped past the Bash hook.** The Phase 9 fix used `shlex.split(cmd, posix=True)` so quoted regex args stay grouped. Posix `shlex` does *not* split on shell operators (`|`, `;`, `&`, `<`, `>`, `(`, `)`) when they're not separated by whitespace. Result:
+
+```
+cat /etc/passwd|head     →  ['cat', '/etc/passwd|head']
+```
+
+The second token contained `|`, the `REGEX_META` skip dropped it as a "regex pattern argument," and the path was never realpath-checked. The whitespaced form (`cat /etc/passwd | head`) was correctly blocked — it tokenized to four args, with `/etc/passwd` clean. Same shape applied to `;`, `&`, `<`, `>`, and `(...)`. One missing space defeated the whole hook.
+
+Fix: `shlex.shlex(cmd, posix=True, punctuation_chars=True)` with `whitespace_split=True`. Operators become their own tokens regardless of surrounding whitespace, so `cat /etc/passwd|head` tokenizes to `['cat', '/etc/passwd', '|', 'head']` — `/etc/passwd` reaches the path check. Quoted args (`grep -E 'a|b'`) still stay grouped because shlex respects quote boundaries before applying punctuation_chars, so the regex-arg false-positive that Phase 9 fixed stays fixed. No new dependency; `punctuation_chars` is stdlib (Python 3.6+).
+
+Added four regression tests covering the no-whitespace `|`, `;`, `<`, and `(...)` shapes. Lesson reinforced from Phase 9: heuristic security code must be tested against the case it claims to fix. Posix-shlex's "operators-need-whitespace" behavior is documented but easy to miss when the test cases all happen to include spaces.
+
+**Breadth: deny-list gaps.** The audit named several patterns covered in `.gitignore` but not in `.claude/settings.json` (or vice versa), plus a few exfil shapes that paired with existing denies but weren't denied themselves:
+
+- `Read(./**/*.p12)`, `Read(./**/*.pfx)`, `Read(./**/id_rsa*)`, `Read(./**/id_ed25519*)`, `Read(./**/*.asc)`, `Read(./**/*.gpg)` — added to `settings.json`. `*.p12` was in `.gitignore` already; the rest filled in symmetrically across both files. Mechanical, no friction cost.
+- `Bash(git remote add:*)`, `Bash(git remote set-url:*)` — paired with the existing `Bash(git push:*)` deny. Without these, an exfil-via-new-remote shape was open: add a remote pointing at attacker-controlled storage, push to it. Niche but cheap to close.
+- `Bash(history:*)` — `history` dumps recent shell commands, which on a developer machine routinely include credentials passed inline. Same env/secret leak surface as the already-denied `printenv` and `env`.
+
+Skipped after consideration: `Bash(export)`, `Bash(set)`, `Bash(declare)`, `Bash(alias)`. Each has legitimate everyday uses Claude needs (`export PATH=...`, `set -e`); the leak shapes are narrower forms (`export -p`, bare `set`). The Claude Code permission matcher matches by command prefix, so blanket-denying these would block legitimate use. Keeping them allowed; if a future audit finds an actual exfil via these, revisit with a more targeted pattern.
+
+**Breadth: pre-commit pattern menu.** The commented menu in `.githooks/pre-commit` (and the matching heredoc in `newproj-safe`) gained `ASIA*` (AWS STS), `rk_live_*` (Stripe restricted), `AIza*` (Google API), `npm_*`, and `sk-ant-*` (Anthropic). All commented-out — enabling per-project remains a deliberate choice; the menu is a starting list, not a default. README's customization table updated to match.
+
+Lesson: a fresh review is worth doing. The deny list and `.gitignore` patterns are easy to skim and judge; the hook is a small program with assumptions baked in, and someone reading it for the first time will spot the cases the original tests didn't cover.
+
+### Phase 12 — Where things stand now (post-audit)
 
 - Layer 1 (prompt) — global `~/.claude/CLAUDE.md` + project `CLAUDE.md` (domain-specific only; the project file should **not** restate the global rules, only add project context).
 - Layer 2 (permissions) — deny list covers network, destructive Bash, secret reads, cross-project reads, outside-project writes.

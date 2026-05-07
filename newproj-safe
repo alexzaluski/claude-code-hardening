@@ -13,6 +13,11 @@ cat > .gitignore <<'GITIGNORE_EOF'
 *.pem
 *.key
 *.p12
+*.pfx
+*.asc
+*.gpg
+id_rsa*
+id_ed25519*
 secrets/
 .venv/
 __pycache__/
@@ -32,17 +37,26 @@ cat > .claude/settings.json <<'SETTINGS_EOF'
       "Bash(scp:*)",
       "Bash(rsync:*)",
       "Bash(git push:*)",
+      "Bash(git remote add:*)",
+      "Bash(git remote set-url:*)",
       "Bash(git reset --hard:*)",
       "Bash(rm -rf /:*)",
       "Bash(rm -rf ~/:*)",
       "Bash(printenv:*)",
       "Bash(env)",
+      "Bash(history:*)",
       "WebFetch",
       "WebSearch",
       "Read(./.env*)",
       "Read(./**/.env*)",
       "Read(./**/*.pem)",
       "Read(./**/*.key)",
+      "Read(./**/*.p12)",
+      "Read(./**/*.pfx)",
+      "Read(./**/*.asc)",
+      "Read(./**/*.gpg)",
+      "Read(./**/id_rsa*)",
+      "Read(./**/id_ed25519*)",
       "Read(../**)",
       "Read(~/**)",
 
@@ -223,12 +237,20 @@ if first in SAFE_FIRST_WORDS:
 # pattern contains a `/`-prefixed substring.
 REGEX_META = set("|()[]^$\\+")
 
-# Shell-tokenize first, so quoted regex arguments stay grouped with
-# their metacharacters (rather than getting split on internal `|`).
+# Shell-tokenize first. `punctuation_chars=True` splits shell operators
+# (`|`, `;`, `&`, `<`, `>`, `(`, `)`) into their own tokens even when
+# they're not surrounded by whitespace, so `cat /etc/passwd|head`
+# tokenizes to ['cat', '/etc/passwd', '|', 'head'] rather than
+# ['cat', '/etc/passwd|head'] — closing the no-space-pipe bypass that
+# previously let the REGEX_META skip drop the whole argument.
+# Quoted regex args (e.g. `grep -E 'a|b'`) stay grouped, so the
+# metacharacter skip below still applies to them.
 # On malformed quoting, fall back to scanning the raw command — the
 # strict path; better than silently passing.
 try:
-    shell_args = shlex.split(cmd, posix=True)
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    shell_args = list(lex)
 except ValueError:
     shell_args = [cmd]
 
@@ -313,13 +335,18 @@ patterns=(
   # Common token classes — uncomment any that apply to this project.
   # The right list is whatever this project's data would expose if
   # committed by accident.
-  # 'AKIA[0-9A-Z]{16}'                                       # AWS access-key IDs
+  # 'AKIA[0-9A-Z]{16}'                                       # AWS access-key IDs (long-lived)
+  # 'ASIA[0-9A-Z]{16}'                                       # AWS session keys (STS, short-lived)
   # 'ghp_[A-Za-z0-9]{36}'                                    # GitHub personal access tokens
   # 'github_pat_[A-Za-z0-9_]{82}'                            # GitHub fine-grained PATs
   # 'xox[baprs]-[A-Za-z0-9-]+'                               # Slack tokens
-  # 'sk_live_[A-Za-z0-9]+'                                   # Stripe live keys
+  # 'sk_live_[A-Za-z0-9]+'                                   # Stripe live secret keys
+  # 'rk_live_[A-Za-z0-9]+'                                   # Stripe live restricted keys
+  # 'AIza[0-9A-Za-z_-]{35}'                                  # Google API keys
+  # 'npm_[A-Za-z0-9]{36}'                                    # npm tokens
   # 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'   # JWTs
   # 'sk-[A-Za-z0-9]{32,}'                                    # OpenAI-style API keys
+  # 'sk-ant-[A-Za-z0-9_-]{90,}'                              # Anthropic API keys
   # 'EAA[A-Za-z0-9]{20,}'                                    # Meta archive tokens
   # Add project-specific patterns here (internal IDs, vendor formats, etc.)
 )

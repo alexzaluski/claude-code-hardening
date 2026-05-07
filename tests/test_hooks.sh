@@ -50,6 +50,10 @@ run_case "regex with character class"              0 "grep -E '[abc]' $TMPROJ/in
 run_case "in-project read allowed"                 0 "cat $TMPROJ/in_project.txt"
 run_case "outside-project read blocked"            2 "cat /etc/hosts"
 run_case "regex arg + outside path: blocks path"   2 "grep -E 'a|b' /etc/hosts"
+run_case "no-space pipe bypass blocked"             2 "cat /etc/passwd|head"
+run_case "no-space semicolon bypass blocked"        2 "cat /etc/shadow;cat /etc/passwd"
+run_case "no-space redirect bypass blocked"         2 "cat </etc/hosts"
+run_case "subshell paren bypass blocked"            2 "(cat /etc/hosts)"
 
 # Drift check: heredoc bodies inside newproj-safe must match the
 # standalone template files. Markers were chosen unique per file so

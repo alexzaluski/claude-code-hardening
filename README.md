@@ -58,12 +58,12 @@ See [HISTORY.md](HISTORY.md) for the security analysis in more depth.
 Each closes a different way data could otherwise flow out of the
 project:
 
-| #   | Layer                   | Mechanism                                                                   | What it constrains                                                                                                                                                                                  |
-| --- | ----------------------- | --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **Prompt**              | `CLAUDE.md` (global + project)                                              | Posture-setting and rules the harness layers can't express; advisory                                                                                                                                |
-| 2   | **Permissions**         | `.claude/settings.json` `permissions.deny`                                  | Reads from outside the project tree, network-egress tools (`WebFetch`/`WebSearch`/`curl`/`wget`/`nc`), destructive shell, writes into `~/.claude/**` (auto-memory, plan mode) and the `/tmp` family |
-| 3   | **Hooks (Claude-time)** | Two `PreToolUse` hooks: one for `Write\|Edit\|NotebookEdit`, one for `Bash` | Generic catch for what the static patterns missed — closes the Bash read-loophole (`cat`, `grep`, `find`, `python3 -c 'open(…)'`) and any write target the deny list didn't enumerate               |
-| 4   | **Hooks (git-time)**    | `.githooks/pre-commit` with project-specific token regexes                  | Tokens or identifiers carried in source data reaching a public commit                                                                                                                               |
+| # | Layer | Mechanism | What it constrains |
+|---|---|---|---|
+| 1 | **Prompt** | `CLAUDE.md` (global + project) | Posture-setting and rules the harness layers can't express; advisory |
+| 2 | **Permissions** | `.claude/settings.json` `permissions.deny` | Reads from outside the project tree, network-egress tools (`WebFetch`/`WebSearch`/`curl`/`wget`/`nc`), destructive shell, writes into `~/.claude/**` (auto-memory, plan mode) and the `/tmp` family |
+| 3 | **Hooks (Claude-time)** | Two `PreToolUse` hooks: one for `Write\|Edit\|NotebookEdit`, one for `Bash` | Generic catch for what the static patterns missed — closes the Bash read-loophole (`cat`, `grep`, `find`, `python3 -c 'open(…)'`) and any write target the deny list didn't enumerate |
+| 4 | **Hooks (git-time)** | `.githooks/pre-commit` with project-specific token regexes | Tokens or identifiers carried in source data reaching a public commit |
 
 Layers 2–4 cost zero tokens per turn; Layer 1 carries only the
 rules the harness can't enforce on its own.
@@ -317,17 +317,20 @@ secret scanning / push protection too — it catches what
 Uncomment / extend the patterns array in `.githooks/pre-commit`.
 Common classes below — token formats might change over time, so it's better to check the service's current docs before relying on a regex:
 
-| Class                                         | Regex                                                  |
-| --------------------------------------------- | ------------------------------------------------------ |
-| AWS access keys                               | `AKIA[0-9A-Z]{16}`                                     |
-| GitHub PATs (classic)                         | `ghp_[A-Za-z0-9]{36}`                                  |
-| GitHub fine-grained PATs                      | `github_pat_[A-Za-z0-9_]{82}`                          |
-| Slack tokens                                  | `xox[baprs]-[A-Za-z0-9-]+`                             |
-| Stripe live keys                              | `sk_live_[A-Za-z0-9]+`                                 |
-| OpenAI-style API keys                         | `sk-[A-Za-z0-9]{32,}`                                  |
-| JWTs                                          | `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+` |
-| Vendor archive tokens (Meta `EAA*`, etc.)     | project-specific                                       |
-| Internal IDs (employee, customer, patient, …) | project-specific                                       |
+| Class | Regex |
+|---|---|
+| AWS access keys (long-lived / STS) | `AKIA[0-9A-Z]{16}` / `ASIA[0-9A-Z]{16}` |
+| GitHub PATs (classic) | `ghp_[A-Za-z0-9]{36}` |
+| GitHub fine-grained PATs | `github_pat_[A-Za-z0-9_]{82}` |
+| Slack tokens | `xox[baprs]-[A-Za-z0-9-]+` |
+| Stripe live keys | `sk_live_[A-Za-z0-9]+` / `rk_live_[A-Za-z0-9]+` |
+| Google API keys | `AIza[0-9A-Za-z_-]{35}` |
+| npm tokens | `npm_[A-Za-z0-9]{36}` |
+| OpenAI-style API keys | `sk-[A-Za-z0-9]{32,}` |
+| Anthropic API keys | `sk-ant-[A-Za-z0-9_-]{90,}` |
+| JWTs | `eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+` |
+| Vendor archive tokens (Meta `EAA*`, etc.) | project-specific |
+| Internal IDs (employee, customer, patient, …) | project-specific |
 
 The right list is whatever the project's *data* would expose if
 committed by accident.
@@ -344,15 +347,15 @@ The risk is deleting blindly. The denials aren't equivalent — some
 open privacy paths, some only restore convenience. Use the table
 below to see which is which before removing anything.
 
-| Deny entry                                                            | What enabling actually opens                                                                            | Cost class                                   |
-| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| `WebFetch`, `WebSearch`, `Bash(curl:*)`, `Bash(wget:*)`, `Bash(nc:*)` | Path 2 — Claude can post project data to any third-party URL                                            | **high (privacy)**                           |
-| `Read(~/**)`, `Read(../**)`                                           | Path 3 — cross-project reads of any other project on the machine                                        | **high (privacy)**                           |
-| `Write(~/.claude/**)` family                                          | Persistent shared state (auto-memory, plan files) carrying project context across sessions and projects | **medium (privacy)**                         |
-| Background-task opt-in (`SAFE_PATH_PREFIXES` in the Bash hook)        | Reads from anything any process writes under `/private/tmp/claude-*`. Restores `run_in_background`.     | **medium (read surface)**                    |
-| `Bash(git push:*)`                                                    | Removes the manual-push speed bump                                                                      | **low (undo cost)**                          |
-| `Bash(git reset --hard:*)`                                            | Lost local work if the model misuses it                                                                 | **low (undo cost)**                          |
-| `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)`                               | Catastrophic accidents                                                                                  | **low (no privacy cost; only blast radius)** |
+| Deny entry | What enabling actually opens | Cost class |
+|---|---|---|
+| `WebFetch`, `WebSearch`, `Bash(curl:*)`, `Bash(wget:*)`, `Bash(nc:*)` | Path 2 — Claude can post project data to any third-party URL | **high (privacy)** |
+| `Read(~/**)`, `Read(../**)` | Path 3 — cross-project reads of any other project on the machine | **high (privacy)** |
+| `Write(~/.claude/**)` family | Persistent shared state (auto-memory, plan files) carrying project context across sessions and projects | **medium (privacy)** |
+| Background-task opt-in (`SAFE_PATH_PREFIXES` in the Bash hook) | Reads from anything any process writes under `/private/tmp/claude-*`. Restores `run_in_background`. | **medium (read surface)** |
+| `Bash(git push:*)` | Removes the manual-push speed bump | **low (undo cost)** |
+| `Bash(git reset --hard:*)` | Lost local work if the model misuses it | **low (undo cost)** |
+| `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)` | Catastrophic accidents | **low (no privacy cost; only blast radius)** |
 
 Two pieces of guidance that hold across all of them:
 
@@ -387,10 +390,10 @@ Both `~/.claude/settings.json` and `<project>/.claude/settings.json`
 exist; deny lists from both **merge** (a global deny can't be
 "allowed" from a project file). Split:
 
-| Belongs in `~/.claude/settings.json` (global)                                                                                                                                                                                                | Belongs in `<project>/.claude/settings.json`                                                                                                                                                   |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Belongs in `~/.claude/settings.json` (global) | Belongs in `<project>/.claude/settings.json` |
+|---|---|
 | Universal denies you never want to relax: `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)`, `Bash(sudo:*)`, `Read(~/.ssh/**)`, `Read(~/.aws/**)`, `Read(~/.gnupg/**)`, `Read(~/.config/gh/**)`, `Write(~/.claude/**)` + Edit/NotebookEdit equivalents | Everything project-shaped: `Read(~/**)`, `Read(../**)`, `WebFetch`/`WebSearch`, `Write(/tmp/**)` family, `Bash(curl:*)`/`wget`/`nc`/`ssh`/`scp`/`rsync`, **the two `PreToolUse` hook entries** |
-| Things that depend on *who you are*                                                                                                                                                                                                          | Things that depend on *what data the project handles*                                                                                                                                          |
+| Things that depend on *who you are* | Things that depend on *what data the project handles* |
 
 **Don't copy the project file verbatim into the global file.** Two
 failure modes:

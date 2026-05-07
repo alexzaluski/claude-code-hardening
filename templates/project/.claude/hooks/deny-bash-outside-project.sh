@@ -89,12 +89,20 @@ if first in SAFE_FIRST_WORDS:
 # pattern contains a `/`-prefixed substring.
 REGEX_META = set("|()[]^$\\+")
 
-# Shell-tokenize first, so quoted regex arguments stay grouped with
-# their metacharacters (rather than getting split on internal `|`).
+# Shell-tokenize first. `punctuation_chars=True` splits shell operators
+# (`|`, `;`, `&`, `<`, `>`, `(`, `)`) into their own tokens even when
+# they're not surrounded by whitespace, so `cat /etc/passwd|head`
+# tokenizes to ['cat', '/etc/passwd', '|', 'head'] rather than
+# ['cat', '/etc/passwd|head'] — closing the no-space-pipe bypass that
+# previously let the REGEX_META skip drop the whole argument.
+# Quoted regex args (e.g. `grep -E 'a|b'`) stay grouped, so the
+# metacharacter skip below still applies to them.
 # On malformed quoting, fall back to scanning the raw command — the
 # strict path; better than silently passing.
 try:
-    shell_args = shlex.split(cmd, posix=True)
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    shell_args = list(lex)
 except ValueError:
     shell_args = [cmd]
 

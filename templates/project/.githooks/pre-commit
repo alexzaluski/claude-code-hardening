@@ -9,13 +9,18 @@ patterns=(
   # Common token classes — uncomment any that apply to this project.
   # The right list is whatever this project's data would expose if
   # committed by accident.
-  # 'AKIA[0-9A-Z]{16}'                                       # AWS access-key IDs
+  # 'AKIA[0-9A-Z]{16}'                                       # AWS access-key IDs (long-lived)
+  # 'ASIA[0-9A-Z]{16}'                                       # AWS session keys (STS, short-lived)
   # 'ghp_[A-Za-z0-9]{36}'                                    # GitHub personal access tokens
   # 'github_pat_[A-Za-z0-9_]{82}'                            # GitHub fine-grained PATs
   # 'xox[baprs]-[A-Za-z0-9-]+'                               # Slack tokens
-  # 'sk_live_[A-Za-z0-9]+'                                   # Stripe live keys
+  # 'sk_live_[A-Za-z0-9]+'                                   # Stripe live secret keys
+  # 'rk_live_[A-Za-z0-9]+'                                   # Stripe live restricted keys
+  # 'AIza[0-9A-Za-z_-]{35}'                                  # Google API keys
+  # 'npm_[A-Za-z0-9]{36}'                                    # npm tokens
   # 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'   # JWTs
   # 'sk-[A-Za-z0-9]{32,}'                                    # OpenAI-style API keys
+  # 'sk-ant-[A-Za-z0-9_-]{90,}'                              # Anthropic API keys
   # 'EAA[A-Za-z0-9]{20,}'                                    # Meta archive tokens
   # Add project-specific patterns here (internal IDs, vendor formats, etc.)
 )
