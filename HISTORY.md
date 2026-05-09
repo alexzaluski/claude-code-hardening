@@ -277,6 +277,77 @@ Lesson: a fresh review is worth doing. The deny list and `.gitignore` patterns a
 - Layer 4 (git-time hook) — `.githooks/pre-commit` blocks commits matching configured token regexes.
 - Scaffold propagates Layers 2 + 3 + 4 to every new project, with optional `git init`.
 
+### Phase 13 — Hardening meets harness skills (the `/fewer-permission-prompts` test)
+
+A new project hardened with the post-audit profile produced two
+findings worth recording, plus one open design question.
+
+**Finding 1: `/fewer-permission-prompts` blocked at the hook, correctly.**
+The skill scans `~/.claude/projects/<slug>/*.jsonl` to mine common
+read-only Bash patterns and propose an allow-list. The Bash hook
+denied the scan — `~/.claude/projects/` is outside the project
+tree, hook fired exactly as designed, transcript reads were refused.
+The skill offered an in-session fallback ("suggest from this
+conversation only"), which is the right answer: smaller signal, no
+boundary crossed. Take-away: **harness skills that need
+`~/.claude/**` access are incompatible with the strict scoping by
+construction, and that's fine.** Use the in-session fallback they
+offer; do not relax the hook for skill convenience.
+
+**Finding 2: model-side misattribution under deny-heavy regimes.**
+While testing in the same project, Bash prompts kept getting denied
+(default `ask` mode, no curated allow list yet) while in-project
+`Read` calls had session-cached approval. The session's assistant
+narrated this as *"permissions tightened mid-session"* — a clean
+hallucination explaining the asymmetry. The actual mechanism (Read
+got approved earlier in the session, Bash always re-prompts) wasn't
+recognised. Pattern is broader than this project: **a model under a
+deny-heavy regime will sometimes invent a story for the friction
+rather than recognising the permission-prompt mechanism.** Worth
+noting because it can shape downstream decisions — here the
+misdiagnosis nudged the assistant toward defensive Edit-without-Read
+sequences, which is not the failure mode the hardening was designed
+to encourage.
+
+**Open question — should the hook recognise the project's own
+transcripts as in-scope?** Project transcripts live at
+`~/.claude/projects/<slug>/*.jsonl` — physically outside the project
+tree, but logically project data (the harness writes them as a
+record of *this project's* sessions). The current setup blocks them
+as part of the broader `~/.claude/**` block. That's
+conservative-but-correct under the current design: the model never
+needs to re-read these during normal operation (live context lives
+in memory, `/compact` summarises in-place, `/resume` loads them
+through harness code paths the hook doesn't intercept), so blocking
+them costs nothing in normal use — and the only case that breaks
+(`/fewer-permission-prompts`) has a fallback. Approaches if this
+proves inconvenient later:
+
+1. **Status quo — keep strict, document the trade-off.** Skills that
+   want broader signal use their in-session fallback. Simplest;
+   no per-project hook logic. Current default.
+2. **Static per-project carve-out via `SAFE_PATH_PREFIXES`.** Edit
+   the hook in a specific project to allow
+   `~/.claude/projects/-Users-<…>-<project-name>/`. Easy, but
+   manual; the path encodes the project location, so it breaks if
+   the project moves.
+3. **Slug-derived auto-allow.** Compute the slug from
+   `$CLAUDE_PROJECT_DIR` at hook-run time (replace `/` with `-`)
+   and allow that one transcript directory. Tracks the project
+   automatically, but adds Claude-Code-specific knowledge to the
+   hook (the slug-derivation rule). Worth doing only if option 2
+   gets used in more than one project.
+4. **Make the carve-out skill-specific, not path-specific.** Don't
+   change the hook; instead, when a skill needs transcripts, run
+   it manually with a temporarily-relaxed permission profile, then
+   revert. Avoids encoding harness internals into the hook at the
+   cost of session-level operational toil.
+
+Leaning toward option 1 until evidence accumulates that more than
+one skill needs this. Revisit if a second skill bumps into the same
+boundary.
+
+
 ---
 
 ## Reference appendix
@@ -330,6 +401,8 @@ Git-commit leakage     ← Layer 4 (.githooks/pre-commit) + gitleaks pre-push + 
 - No cross-project reads (`Read(~/**)`, `Read(../**)`). Paste snippets if you need comparison.
 - Auto-memory disabled in practice. Session-scoped-only is intentional.
 - Background `Bash` (`run_in_background: true`) unusable by default. Output buffers land under `/private/tmp/claude-<uid>/...`, which the Bash hook denies for reads. Foreground only. A narrow opt-in (`SAFE_PATH_PREFIXES = ("/private/tmp/claude-",)` in the hook) restores it at the cost of allowing reads of anything any process writes under that prefix; the strict default keeps it blocked.
+- Skills that mine `~/.claude/projects/**` transcripts (e.g. `/fewer-permission-prompts`) cannot do their cross-session scan; they fall back to in-session evidence. Smaller signal, no hardening change needed.
+
 
 ### Recurring questions
 
