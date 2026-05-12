@@ -63,7 +63,7 @@ project:
 |---|---|---|---|
 | 1 | **Prompt** | `CLAUDE.md` (global + project) | Posture-setting and rules the harness layers can't express; advisory |
 | 2 | **Permissions** | `.claude/settings.json` `permissions.deny` | Reads from outside the project tree, network-egress tools (`WebFetch`/`WebSearch`/`curl`/`wget`/`nc`), destructive shell, writes into `~/.claude/**` (auto-memory, plan mode) and the `/tmp` family |
-| 3 | **Hooks (Claude-time)** | Two `PreToolUse` hooks: one for `Write\|Edit\|NotebookEdit`, one for `Bash` | Generic catch for what the static patterns missed — closes the Bash read-loophole (`cat`, `grep`, `find`, `python3 -c 'open(…)'`) and any write target the deny list didn't enumerate |
+| 3 | **Hooks (Claude-time)** | Two `PreToolUse` hooks: one for `Write\|Edit\|NotebookEdit\|Read`, one for `Bash` | Generic catch for what the static patterns missed — enforces the project boundary on every file-path-bearing tool call (Read, Write, Edit, NotebookEdit) plus every Bash command, via `realpath` against `$CLAUDE_PROJECT_DIR` |
 | 4 | **Hooks (git-time)** | `.githooks/pre-commit` with project-specific token regexes | Tokens or identifiers carried in source data reaching a public commit |
 
 Layers 2–4 cost zero tokens per turn; Layer 1 carries only the
@@ -89,7 +89,7 @@ rules the harness can't enforce on its own.
         ├── .claude/
         │   ├── settings.json                          ← project deny list + hook registrations
         │   └── hooks/
-        │       ├── deny-outside-project.sh            ← Write/Edit/NotebookEdit guard
+        │       ├── deny-outside-project.sh            ← Read/Write/Edit/NotebookEdit guard
         │       └── deny-bash-outside-project.sh       ← Bash path guard
         └── .githooks/
             └── pre-commit                             ← token-pattern blocker
@@ -274,11 +274,13 @@ for the full list.
 
 Two `PreToolUse` hooks plug the holes Layer 2 misses:
 
-**`deny-outside-project.sh`** matches `Write|Edit|NotebookEdit`.
+**`deny-outside-project.sh`** matches `Write|Edit|NotebookEdit|Read`.
 Reads the tool-call JSON from stdin, extracts `file_path` (or
 `notebook_path`), resolves to a realpath, exits 2 with a `BLOCKED`
-message if the target is outside `$CLAUDE_PROJECT_DIR`. Catches any
-write the static deny list didn't enumerate.
+message if the target is outside `$CLAUDE_PROJECT_DIR`. Same logic
+for all four tools — catches any outside-project write the deny list
+didn't enumerate, and closes the Read-tool gap left when `Read(~/**)`
+was removed (see HISTORY phase 13).
 
 **`deny-bash-outside-project.sh`** matches `Bash`. Parses the command, extracts path-looking tokens (start with `/`, `~`, or `./`), realpath-resolves each, blocks anything outside the project. Has three allow-lists (safe first-words like `echo`/`realpath`, kernel devices like `/dev/null`, regex-pattern arguments via `shlex`) and one opt-in `SAFE_PATH_PREFIXES` that restores `run_in_background` at the cost of allowing reads under `/private/tmp/claude-*`. See the script header for the full lists.
 

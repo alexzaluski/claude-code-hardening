@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# PreToolUse hook: block Write/Edit/NotebookEdit whose target file_path
-# falls outside $CLAUDE_PROJECT_DIR.
+# PreToolUse hook: block Write/Edit/NotebookEdit/Read whose target
+# file_path falls outside $CLAUDE_PROJECT_DIR. Same logic for all four
+# tools — the harness passes `file_path` (or `notebook_path`) in
+# `tool_input`, the hook realpath-resolves it and rejects anything
+# that doesn't land inside the project tree.
 set -euo pipefail
 
 command -v python3 >/dev/null 2>&1 || {
@@ -30,11 +33,11 @@ project_real=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" 
 case "$abs" in
   "$project_real"/*|"$project_real") exit 0 ;;
   *)
-    echo "BLOCKED by deny-outside-project.sh: write target" >&2
+    echo "BLOCKED by deny-outside-project.sh: tool target" >&2
     echo "  $abs" >&2
     echo "is outside project directory" >&2
     echo "  $project_real" >&2
-    echo "Project scope rule (CLAUDE.md) forbids outside-project writes." >&2
+    echo "Project scope rule (CLAUDE.md) forbids outside-project access." >&2
     exit 2
   ;;
 esac

@@ -19,6 +19,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HOOK="$REPO_ROOT/templates/project/.claude/hooks/deny-bash-outside-project.sh"
+FILE_HOOK="$REPO_ROOT/templates/project/.claude/hooks/deny-outside-project.sh"
 NEWPROJ="$REPO_ROOT/newproj-safe"
 TPL="$REPO_ROOT/templates/project"
 
@@ -60,6 +61,34 @@ run_case "no-space pipe bypass blocked"             2 "cat /etc/passwd|head"
 run_case "no-space semicolon bypass blocked"        2 "cat /etc/shadow;cat /etc/passwd"
 run_case "no-space redirect bypass blocked"         2 "cat </etc/hosts"
 run_case "subshell paren bypass blocked"            2 "(cat /etc/hosts)"
+
+# File-path hook (deny-outside-project.sh) — same logic for Read,
+# Write, Edit, NotebookEdit. Builds a payload with `file_path` rather
+# than `command`. Covers the Phase 13 follow-up: closing the
+# Read-tool gap that opened when `Read(~/**)` was removed.
+run_file_case() {
+    local name="$1" expect="$2" path="$3"
+    local payload
+    payload=$(python3 -c 'import json,sys; print(json.dumps({"tool_input":{"file_path":sys.argv[1]}}))' "$path")
+    local output actual
+    set +e
+    output=$(printf '%s' "$payload" | bash "$FILE_HOOK" 2>&1)
+    actual=$?
+    set -e
+    if [ "$actual" = "$expect" ]; then
+        printf 'PASS  %s\n' "$name"
+    else
+        printf 'FAIL  %s (expected exit=%s, got=%s)\n' "$name" "$expect" "$actual"
+        printf '      path: %s\n' "$path"
+        printf '      output: %s\n' "$output"
+        fail=1
+    fi
+}
+echo
+echo "File-path hook behavior (Read/Write/Edit/NotebookEdit):"
+run_file_case "in-project path allowed"             0 "$TMPROJ/in_project.txt"
+run_file_case "outside-project absolute path blocked" 2 "/etc/hosts"
+run_file_case "outside-project home path blocked"   2 "$HOME/.ssh/config"
 
 # Drift check: heredoc bodies inside newproj-safe must match the
 # standalone template files. Markers were chosen unique per file so
