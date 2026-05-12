@@ -20,7 +20,7 @@ By default, project data can flow in four directions, none of them blocked or ev
 
 1. **To Anthropic.** Every file Claude reads is sent off-machine on the next turn, then re-sent on every subsequent turn it stays in context. The same content lands in a plaintext transcript on disk that persists across sessions until you prune it.
 2. **To third-party services.** Claude-invoked HTTP tools (`WebFetch`, `WebSearch`, `curl`, `wget`, `nc`) can post project data to any URL the model decides on. Nothing constrains the destination by default.
-3. **To other projects on the same machine.** Cross-project reads (`Read(~/**)`) let Claude pull from neighbouring projects, and shared `~/.claude/**` state — auto-memory and plan mode — silently carries context between sessions you thought were unrelated.
+3. **To other projects on the same machine.** Nothing in the default configuration scopes Claude's filesystem access to the current project — it can read from neighbouring projects via the `Read` tool or via Bash subprocesses (`cat`, `grep`, …). On top of that, shared `~/.claude/**` state — auto-memory and plan mode — silently carries context between sessions you thought were unrelated.
 4. **To public git history.** Tokens or identifiers in source data can slip into commits, notes, or reports — and once pushed, they're effectively permanent: any clone or mirror will carry the leak even if you rewrite history afterwards.
 
 This repo packages a four-layer profile that constrains those flows at the harness level, where the model can't drift past them. Disk encryption, access control, and what happens before Claude is involved are out of scope.
@@ -50,6 +50,7 @@ Here's what the four layers catch and what they don't protect against.
 - **Subprocess-initiated I/O.** A Python/Node script started by Claude inherits process privileges; a poisoned dependency bypasses Layers 2–3. Needs OS-level isolation (container with `--network=none`).
 - **Inference itself + provider-side retention.** Every turn reaches Anthropic; Pro/Max has no Zero Data Retention.
 - **Compromised host.** A malicious process running as your user sees what Claude sees.
+- **Harness-version drift.** The declarative deny list's semantics are interpreted by Claude Code, not by this repo. A version bump can silently change how a rule matches — Phase 13 in [HISTORY.md](HISTORY.md) documents `Read(~/**)` shifting from "blocks cross-project reads" to "blocks every project file when the project is under `~`," with no warning or release-note flag. Hook-based enforcement (Layer 3) is more robust here because the matching logic lives in code we control. The test suite's *forbidden-patterns* assertion guards against silent reintroduction of known-bad rules but cannot predict future semantic drift.
 
 See [HISTORY.md](HISTORY.md) for the security analysis in more depth.
 
@@ -77,7 +78,7 @@ rules the harness can't enforce on its own.
 ├── SECURITY.md                                        ← reporting + scope (process only)
 ├── newproj-safe                                       ← scaffold script (install to ~/bin)
 ├── tests/
-│   └── test_hooks.sh                                  ← Bash hook regression + drift check
+│   └── test_hooks.sh                                  ← hook behaviour + drift + invariants checks
 └── templates/
     ├── global/                                        ← copy into ~/.claude/
     │   ├── settings.json                              ← universal denies (apply everywhere)
@@ -260,7 +261,7 @@ it fires. Categories included by default:
 - **Destructive shell**: `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)`,
   `Bash(git push:*)`, `Bash(git reset --hard:*)`
 - **Secret reads**: `Read(./.env*)`, `Read(./**/*.pem)`, `*.key`
-- **Cross-project reads**: `Read(../**)`, `Read(~/**)`
+- **Cross-project reads**: `Read(../**)` (Read tool, parent-relative); the Bash hook covers absolute paths via `realpath` against `$CLAUDE_PROJECT_DIR`
 - **Outside-project writes**: `Write(~/.claude/**)` + Edit /
   NotebookEdit equivalents, `/tmp/**` family
 
@@ -350,7 +351,7 @@ below to see which is which before removing anything.
 | Deny entry | What enabling actually opens | Cost class |
 |---|---|---|
 | `WebFetch`, `WebSearch`, `Bash(curl:*)`, `Bash(wget:*)`, `Bash(nc:*)` | Path 2 — Claude can post project data to any third-party URL | **high (privacy)** |
-| `Read(~/**)`, `Read(../**)` | Path 3 — cross-project reads of any other project on the machine | **high (privacy)** |
+| `Read(../**)` + the `Bash` PreToolUse hook | Path 3 — cross-project reads of any other project on the machine | **high (privacy)** |
 | `Write(~/.claude/**)` family | Persistent shared state (auto-memory, plan files) carrying project context across sessions and projects | **medium (privacy)** |
 | Background-task opt-in (`SAFE_PATH_PREFIXES` in the Bash hook) | Reads from anything any process writes under `/private/tmp/claude-*`. Restores `run_in_background`. | **medium (read surface)** |
 | `Bash(git push:*)` | Removes the manual-push speed bump | **low (undo cost)** |
@@ -392,7 +393,7 @@ exist; deny lists from both **merge** (a global deny can't be
 
 | Belongs in `~/.claude/settings.json` (global) | Belongs in `<project>/.claude/settings.json` |
 |---|---|
-| Universal denies you never want to relax: `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)`, `Bash(sudo:*)`, `Read(~/.ssh/**)`, `Read(~/.aws/**)`, `Read(~/.gnupg/**)`, `Read(~/.config/gh/**)`, `Write(~/.claude/**)` + Edit/NotebookEdit equivalents | Everything project-shaped: `Read(~/**)`, `Read(../**)`, `WebFetch`/`WebSearch`, `Write(/tmp/**)` family, `Bash(curl:*)`/`wget`/`nc`/`ssh`/`scp`/`rsync`, **the two `PreToolUse` hook entries** |
+| Universal denies you never want to relax: `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)`, `Bash(sudo:*)`, `Read(~/.ssh/**)`, `Read(~/.aws/**)`, `Read(~/.gnupg/**)`, `Read(~/.config/gh/**)`, `Write(~/.claude/**)` + Edit/NotebookEdit equivalents | Everything project-shaped: `Read(../**)`, `Read(./.env*)` family, `WebFetch`/`WebSearch`, `Write(/tmp/**)` family, `Bash(curl:*)`/`wget`/`nc`/`ssh`/`scp`/`rsync`, **the two `PreToolUse` hook entries** |
 | Things that depend on *who you are* | Things that depend on *what data the project handles* |
 
 **Don't copy the project file verbatim into the global file.** Two
@@ -404,7 +405,7 @@ failure modes:
    project that doesn't have the scaffold, the script doesn't exist
    and every Write/Edit/Bash call fails the precondition.
 2. **Over-restriction in legitimate work.** Globalizing
-   `Read(~/**)`, `WebFetch`, or `Bash(curl:*)` blocks routine work
+   `Read(../**)`, `WebFetch`, or `Bash(curl:*)` blocks routine work
    in non-sensitive side projects.
 
 After changing either scope, **restart any open Claude session** —
@@ -428,19 +429,15 @@ this repo, run the bundled regression test before publishing:
 bash tests/test_hooks.sh
 ```
 
-It exercises the Bash hook against six cases (kernel-device
-pass-through, three regex shapes, an in-project read, an
-outside-project read) and verifies that the heredocs inside
-`newproj-safe` haven't drifted from the standalone files in
-`templates/project/`. Twelve checks total; expects all green.
+The suite runs in three layers (26 checks at time of writing; expects all green):
 
-The test is scoped narrowly: it does **not** check deny-list contents,
-`CLAUDE.md`, or the pre-commit token patterns. Changing those (e.g.
-relaxing a deny for a specific project) won't turn the test red,
-because they're per-project decisions rather than properties of the
-shipped scaffold. For verifying those, use the
-[first-launch sanity test](#first-launch-sanity-test) inside the
-project itself.
+1. **Behaviour** — exercises the Bash hook against ten cases: the boring positives (in-project read allowed, outside-project read blocked), three regex/kernel-device false-positive shapes that have previously broken the hook, and four regression cases for the Phase 11 no-whitespace shell-operator bypass (`cat /etc/passwd|head`, `... ;...`, `... </...`, `(cat /etc/...)`).
+2. **Drift** — verifies that the heredoc bodies inside `newproj-safe` match the standalone template files in `templates/project/` byte-for-byte. Catches "edited one, forgot to update the other."
+3. **Invariants** — JSON validity for every shipped `settings.json`, executability for every hook script, a **forbidden-patterns** assertion (entries we deliberately removed and never want to see reintroduced — currently `Read(~/**)` with the Phase 13 reason inline), and a **required-patterns** assertion (audit-driven additions like `Bash(history:*)` and the key-file globs that would be load-bearing losses if silently dropped).
+
+What the suite still does *not* cover: `CLAUDE.md` content, pre-commit token patterns, or the per-project decisions that are meant to vary (custom allow lists, project-specific denies). For those, use the [first-launch sanity test](#first-launch-sanity-test) inside the project itself.
+
+The "Invariants" layer was added specifically in response to the `Read(~/**)` over-match in Phase 13 — a rule that was correct when this project was first released started silently matching every project file after a Claude Code update changed how Read-tool paths get normalised. The new assertions can't predict the *next* such shift (a static check can't simulate the harness), but they prevent the matching kind of regression — silent removal of an audit-driven deny, silent reintroduction of a known-bad pattern — from going unnoticed.
 
 ## Periodic hygiene
 

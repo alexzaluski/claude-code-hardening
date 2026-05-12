@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Tests for the Bash hook + drift check between newproj-safe heredocs
-# and the standalone template files. Run from any directory; resolves
-# its own paths.
+# Three layers of checks for the hardening templates:
 #
-# Cases come from the Phase 9 audit: the four boring positives, plus
-# two that previously broke the hook (the /dev/null false positive and
-# the regex-pattern false positive).
+#   1. Behaviour — the Bash hook does what it should on a handful of
+#      representative commands (boring positives, plus the false-positive
+#      cases that have previously broken the hook, plus regression
+#      tests for the Phase 11 no-whitespace-operator bypass).
+#   2. Drift — the heredoc bodies inside `newproj-safe` match the
+#      standalone template files byte-for-byte. Catches "edited one,
+#      forgot to update the other."
+#   3. Invariants — design decisions we don't want silently reverted:
+#      JSON validity, hook executability, the audit-driven required
+#      patterns, and the forbidden patterns we removed on purpose.
 #
-# Exit 0 if all green, 1 if anything failed.
+# Run from any directory; resolves its own paths. Exit 0 if all
+# green, 1 if anything failed.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -73,7 +79,7 @@ check_drift() {
         printf 'PASS  drift: %s\n' "$name"
     else
         printf 'FAIL  drift: %s (heredoc %s vs %s)\n' "$name" "$marker" "$tpl_file"
-        diff <(extract_heredoc "$marker") "$tpl_file" | head -40
+        diff <(extract_heredoc "$marker") "$tpl_file" | head -40 || true
         fail=1
     fi
 }
@@ -86,6 +92,66 @@ check_drift "deny-outside-project"  "WRITE_HOOK_EOF" "$TPL/.claude/hooks/deny-ou
 check_drift "deny-bash-outside-pj"  "BASH_HOOK_EOF"  "$TPL/.claude/hooks/deny-bash-outside-project.sh"
 check_drift ".githooks/pre-commit"  "PRECOMMIT_EOF"  "$TPL/.githooks/pre-commit"
 check_drift "CLAUDE.md"             "CLAUDEMD_EOF"   "$TPL/CLAUDE.md"
+
+echo
+echo "Invariants:"
+
+# JSON validity for every settings.json we ship.
+for f in "$TPL/.claude/settings.json" "$REPO_ROOT/templates/global/settings.json"; do
+    if python3 -m json.tool < "$f" >/dev/null 2>&1; then
+        printf 'PASS  json valid: %s\n' "${f#$REPO_ROOT/}"
+    else
+        printf 'FAIL  json invalid: %s\n' "${f#$REPO_ROOT/}"
+        fail=1
+    fi
+done
+
+# Hook scripts executable. Lost +x silently turns the hook into a
+# no-op (the harness logs an error but doesn't block); catch that.
+for h in "$TPL/.claude/hooks"/*.sh; do
+    if [ -x "$h" ]; then
+        printf 'PASS  executable: %s\n' "${h#$REPO_ROOT/}"
+    else
+        printf 'FAIL  not executable: %s\n' "${h#$REPO_ROOT/}"
+        fail=1
+    fi
+done
+
+# Forbidden patterns — entries we have deliberately removed and never
+# want to see come back. Each row pairs the pattern with the reason,
+# so future-you understands why this assertion exists.
+forbidden=(
+    'Read(~/**)|Phase 13: over-matches project files when project is under ~'
+)
+for entry in "${forbidden[@]}"; do
+    pat="${entry%%|*}"
+    why="${entry##*|}"
+    if grep -qF "\"$pat\"" "$TPL/.claude/settings.json"; then
+        printf 'FAIL  forbidden pattern present: %s  (reason: %s)\n' "$pat" "$why"
+        fail=1
+    else
+        printf 'PASS  forbidden pattern absent: %s\n' "$pat"
+    fi
+done
+
+# Required patterns — audit-driven additions that would be load-bearing
+# losses if silently dropped. One representative entry per category,
+# not the full enumeration.
+required=(
+    'Bash(history:*)'
+    'Bash(git remote add:*)'
+    'Bash(git remote set-url:*)'
+    'Read(./**/*.p12)'
+    'Read(./**/id_rsa*)'
+)
+for pat in "${required[@]}"; do
+    if grep -qF "\"$pat\"" "$TPL/.claude/settings.json"; then
+        printf 'PASS  required pattern present: %s\n' "$pat"
+    else
+        printf 'FAIL  required pattern missing: %s\n' "$pat"
+        fail=1
+    fi
+done
 
 echo
 if [ "$fail" -eq 0 ]; then

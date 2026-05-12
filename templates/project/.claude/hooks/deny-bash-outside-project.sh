@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # PreToolUse hook for Bash: block commands whose path arguments resolve
-# outside $CLAUDE_PROJECT_DIR. Closes the read-side loophole where
-# `Read(~/**)` denies are bypassed via `cat`, `grep`, `find`, etc.
+# outside $CLAUDE_PROJECT_DIR. Enforces the project boundary for any
+# Bash call that reads or writes file content (`cat`, `grep`, `find`,
+# `python3 -c 'open(...)'`, etc.). The Read tool has narrower
+# pattern-based denies in settings.json; this hook is what stops
+# subprocess-mediated bypasses of those.
 #
 # Heuristic: scan the command for path-looking tokens (start with /, ~,
 # or ./), resolve each to a realpath, reject if any are outside project.
