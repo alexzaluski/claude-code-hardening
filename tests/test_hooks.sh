@@ -62,6 +62,16 @@ run_case "no-space semicolon bypass blocked"        2 "cat /etc/shadow;cat /etc/
 run_case "no-space redirect bypass blocked"         2 "cat </etc/hosts"
 run_case "subshell paren bypass blocked"            2 "(cat /etc/hosts)"
 
+# .env guard — mirrors settings.json Read(./**/.env*) for Bash. These
+# paths are in-project (or relative), so the boundary scan deliberately
+# passes them; the exit=2 comes from the dedicated .env check.
+run_case ".env relative read blocked"               2 "cat .env.local"
+run_case ".env in nested dir blocked"               2 "cat nested/.env"
+run_case "in-project .env still blocked"            2 "cat $TMPROJ/.env"
+run_case ".env.example blocked (matches glob)"      2 "cat .env.example"
+run_case "foo.env.example readable name allowed"    0 "cat foo.env.example"
+run_case "environment substring not matched"        0 "echo environment"
+
 # File-path hook (deny-outside-project.sh) — same logic for Read,
 # Write, Edit, NotebookEdit. Builds a payload with `file_path` rather
 # than `command`. Covers the Phase 13 follow-up: closing the

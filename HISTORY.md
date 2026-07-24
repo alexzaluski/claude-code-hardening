@@ -379,6 +379,72 @@ Leaning toward option 1 until evidence accumulates that more than
 one skill needs this. Revisit if a second skill bumps into the same
 boundary.
 
+### Phase 15 — Tool-scoped denies don't reach subprocesses (`.env` case)
+
+Found preventively while checking whether a claim held up, not by
+observing a leak. In a hardened project, a file was placed on the
+assumption that it "shouldn't be readable to coding agents." Checking
+that assumption against the actual controls showed the two relevant
+mechanisms left a hole between them.
+
+**The gap.** `settings.json` denies `Read(./.env*)` and
+`Read(./**/.env*)`, and that deny genuinely works — a probe file was
+refused with *"File is in a directory that is denied by your permission
+settings."* But it binds only the **Read tool**. The Bash hook, meanwhile,
+enforces only the *project boundary*: paths resolving outside
+`$CLAUDE_PROJECT_DIR`. An in-project `.env` file satisfies both — the
+Read deny doesn't apply to Bash, and the boundary hook allows in-project
+paths by design. Neither was buggy; the file simply fell between their
+scopes. A plain `cat <in-project>/.env*` reached the contents, and the
+only thing left standing was the global CLAUDE.md line *"Bash is not an
+escape hatch for Read denies"* — policy, not enforcement, effective only
+while the model complies.
+
+**Why this counts as an inconsistency rather than a nitpick.**
+`settings.json` already denies `printenv`, `env`, and `history` — the
+config's intent to stop secret leakage *through Bash* was already
+expressed. Environment variables were mechanically blocked; the files
+holding those same values were not. The fix makes the Bash side
+consistent with intent that was already there.
+
+**Fix applied.** A second, independent guard at the bottom of the Bash
+hook mirroring the `.env*` globs. Deliberately separate from the
+boundary scan above it: it applies to **in-project** paths (which the
+scan allows by design) and does **not** skip regex-looking arguments,
+since a secrets guard should err toward refusing. Matching is on path
+*components*, so `a/b/.env.local` is caught while `environment` and
+`--env-file` are not. It tracks the Read glob exactly — a committed
+`.env.example` is blocked too; a template meant to stay readable is
+named so it doesn't lead with `.env` (e.g. `foo.env.example`). It blocks
+path *references* rather than trying to enumerate which subcommands read
+content; a script that loads a `.env` internally is unaffected, since the
+path never appears on the command line.
+
+Known limit: the joined form `--env-file=.env` tokenizes as a single
+argument with no `.env`-leading component and passes; the
+space-separated form is caught. Same category as the pre-existing
+constructed-path and command-substitution limits.
+
+Six behaviour tests lock in the heuristic and both intentional
+non-matches, so the guard can't silently loosen or start over-blocking.
+The drift check did its job — the `newproj-safe` heredoc was updated
+only because the test caught the mismatch.
+
+**Lesson — scope-gap analysis between controls.** Both mechanisms were
+individually correct and individually tested. The hole existed only in
+the space *between* their scopes, which is exactly what per-control
+review doesn't surface. The generalizable question: for each control,
+what does it bind to (a tool? a path class? a command?), and does
+anything a neighbouring control was meant to protect fall outside all of
+them? Here the answer was "a tool-scoped deny doesn't survive the jump
+to a subprocess" — a shape likely to recur wherever a Layer 2 pattern
+deny protects something Bash can also reach.
+
+**Method note.** The gap was identified by comparing the two mechanisms'
+declared scopes, not by executing the bypass — attempting it is what the
+rule forbids. Preventive findings like this should be raised as a caveat
+for the operator to decide on, not acted on unilaterally.
+
 
 ---
 

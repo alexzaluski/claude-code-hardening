@@ -31,6 +31,22 @@
 #     directly, but worth noting.
 #   CLAUDE.md still asks the model to respect the spirit of the rule
 #   for cases this script can't see into.
+#
+# SECOND RULE — .env PATHS:
+#   settings.json denies `Read(./.env*)` and `Read(./**/.env*)`, but those
+#   bind only the Read tool; a subprocess like `cat .env` or
+#   `grep KEY .env.local` reaches the same files unimpeded. The check at the
+#   bottom of this file mirrors those globs for Bash, so the deny is
+#   mechanical rather than a matter of the model honoring CLAUDE.md.
+#
+#   Heuristic: reject any argument with a path component starting with `.env`.
+#   Matches the Read globs exactly, so committed `.env*` templates are blocked
+#   too; a template meant to stay readable is named so it does not start with
+#   `.env` (e.g. `foo.env.example`).
+#
+#   Blocks path REFERENCES, not just reads: cheaper than enumerating which
+#   subcommands read content. A script that loads a .env internally is
+#   unaffected — the path never appears on the command line.
 
 set -euo pipefail
 
@@ -170,6 +186,50 @@ if [ -n "$violations" ]; then
     done
     echo >&2
     echo "If this lookup is genuinely needed, ask the user; do not retry without their say-so." >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# .env guard — Bash mirror of settings.json `Read(./**/.env*)`
+#
+# Independent of the boundary scan above on purpose: this one applies to
+# in-project paths (which the scan deliberately allows) and does NOT skip
+# regex-looking arguments, since a secrets guard should err toward refusing.
+# ---------------------------------------------------------------------------
+env_hits=$(python3 - "$cmd" <<'PY'
+import shlex, sys
+
+cmd = sys.argv[1]
+
+try:
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    args = list(lex)
+except ValueError:
+    args = [cmd]
+
+hits = []
+for arg in args:
+    # Match on path COMPONENTS so `a/b/.env.local` is caught while
+    # `--env-file` and `environment` are not. Mirrors the `.env*` glob.
+    if any(part.startswith(".env") for part in arg.split("/")):
+        hits.append(arg)
+
+for h in dict.fromkeys(hits):
+    print(h)
+PY
+)
+
+if [ -n "$env_hits" ]; then
+    echo "BLOCKED by deny-bash-outside-project.sh: command references a .env* path" >&2
+    echo "settings.json denies Read(./**/.env*); this mirrors that deny for Bash," >&2
+    echo "so secrets are not reachable via cat/grep/python/etc." >&2
+    echo "Matched token(s):" >&2
+    printf '%s\n' "$env_hits" | while IFS= read -r token; do
+        echo "  $token" >&2
+    done
+    echo >&2
+    echo "Do not work around this. If the operation is genuinely needed, ask the user to run it." >&2
     exit 2
 fi
 

@@ -260,7 +260,7 @@ it fires. Categories included by default:
   `wget`, `nc`, `ssh`, `scp`, `rsync`
 - **Destructive shell**: `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)`,
   `Bash(git push:*)`, `Bash(git reset --hard:*)`
-- **Secret reads**: `Read(./.env*)`, `Read(./**/*.pem)`, `*.key`
+- **Secret reads**: `Read(./.env*)`, `Read(./**/*.pem)`, `*.key` — these bind the Read tool only; the Bash hook separately mirrors the `.env*` globs so `cat`/`grep` can't reach them (the `*.pem`/`*.key` patterns have no Bash mirror yet)
 - **Cross-project reads**: `Read(../**)` (Read tool, parent-relative); the Bash hook covers absolute paths via `realpath` against `$CLAUDE_PROJECT_DIR`
 - **Outside-project writes**: `Write(~/.claude/**)` + Edit /
   NotebookEdit equivalents, `/tmp/**` family
@@ -282,7 +282,23 @@ for all four tools — catches any outside-project write the deny list
 didn't enumerate, and closes the Read-tool gap left when `Read(~/**)`
 was removed (see HISTORY phase 13).
 
-**`deny-bash-outside-project.sh`** matches `Bash`. Parses the command, extracts path-looking tokens (start with `/`, `~`, or `./`), realpath-resolves each, blocks anything outside the project. Has three allow-lists (safe first-words like `echo`/`realpath`, kernel devices like `/dev/null`, regex-pattern arguments via `shlex`) and one opt-in `SAFE_PATH_PREFIXES` that restores `run_in_background` at the cost of allowing reads under `/private/tmp/claude-*`. See the script header for the full lists.
+**`deny-bash-outside-project.sh`** matches `Bash` and enforces two rules.
+The first is the project boundary: parses the command, extracts
+path-looking tokens (start with `/`, `~`, or `./`), realpath-resolves
+each, blocks anything outside the project. Has three allow-lists (safe
+first-words like `echo`/`realpath`, kernel devices like `/dev/null`,
+regex-pattern arguments via `shlex`) and one opt-in `SAFE_PATH_PREFIXES`
+that restores `run_in_background` at the cost of allowing reads under
+`/private/tmp/claude-*`. See the script header for the full lists.
+
+The second rule mirrors the Layer 2 `Read(./**/.env*)` deny for Bash.
+Layer 2's pattern binds only the Read tool, so `cat .env.local` reached
+in-project secrets that the boundary rule allows by design (see HISTORY
+phase 15). The guard rejects any argument with a path *component*
+starting with `.env` — catching `a/b/.env.local` while leaving
+`environment` and `--env-file` alone. It tracks the Read glob exactly,
+so a committed `.env.example` is blocked too; name templates meant to
+stay readable so they don't lead with `.env` (e.g. `foo.env.example`).
 
 This is **defense-in-depth, not a fortress**. Paths inside command
 substitutions (`cat $(cmd)`), inside quoted script literals
