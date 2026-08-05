@@ -40,6 +40,10 @@ cat > .claude/settings.json <<'SETTINGS_EOF'
       "Bash(git remote add:*)",
       "Bash(git remote set-url:*)",
       "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(git restore:*)",
+      "Bash(git checkout --:*)",
+      "Bash(git checkout .:*)",
       "Bash(rm -rf /:*)",
       "Bash(rm -rf ~/:*)",
       "Bash(printenv:*)",
@@ -149,54 +153,41 @@ chmod +x .claude/hooks/deny-outside-project.sh
 # === .claude/hooks/deny-bash-outside-project.sh (Bash read-loophole blocker) ===
 cat > .claude/hooks/deny-bash-outside-project.sh <<'BASH_HOOK_EOF'
 #!/usr/bin/env bash
-# PreToolUse hook for Bash: block commands whose path arguments resolve
-# outside $CLAUDE_PROJECT_DIR. Enforces the project boundary for any
-# Bash call that reads or writes file content (`cat`, `grep`, `find`,
-# `python3 -c 'open(...)'`, etc.). The Read tool has narrower
-# pattern-based denies in settings.json; this hook is what stops
-# subprocess-mediated bypasses of those.
+# PreToolUse hook for Bash. Three rules, one pass:
 #
-# Heuristic: scan the command for path-looking tokens (start with /, ~,
-# or ./), resolve each to a realpath, reject if any are outside project.
+#   1. PROJECT BOUNDARY — block commands whose path arguments resolve
+#      outside $CLAUDE_PROJECT_DIR. Covers the subprocess routes
+#      (`cat`, `grep`, `find`, …) that settings.json's Read denies
+#      don't bind.
+#   2. .env PATHS — Bash mirror of `Read(./**/.env*)`, which binds the
+#      Read tool only. Applies to in-project paths, which rule 1 allows
+#      by design.
+#   3. WRAPPED COMMAND DENIES — re-apply settings.json's `Bash(...)`
+#      entries to scripts carried inside a wrapper, where the harness
+#      matcher sees only the outer first word. Specs are read from
+#      settings.json at run time, so they cannot drift from it.
+#      Extracted scripts only; bare commands are the harness's job.
 #
-# KNOWN LIMITS (defense-in-depth, not a fortress):
-#   - Misses paths inside command substitutions: `cat $(cmd)`
-#   - Misses paths inside script string literals:
-#     `python3 -c 'open("/etc/hosts")'`
-#   - Misses paths constructed via env vars set in the same command
-#   - REGEX PATTERN ARGUMENTS: tokens containing regex metacharacters
-#     (|, (, ), [, ], ^, $, \, +) are treated as patterns, not paths,
-#     so a `/`-prefixed substring inside `grep -E '...|/private/tmp|...'`
-#     does not trip the heuristic. Trade-off: a constructed path that
-#     happens to contain one of those chars (e.g. `/some/$VAR/file`)
-#     is also skipped — same category as the env-var limit above.
-#   - SYMLINKS: paths are realpath-resolved before the in/out check.
-#     A symlink inside the project pointing outside resolves outside
-#     and is correctly blocked. The flip side: a project-internal
-#     symlink to a vendored or sibling-workspace directory (e.g. a
-#     `node_modules` link that points outside the tree) will also be
-#     blocked. Inbound symlinks like `/tmp/foo -> <project>/secret`
-#     resolve back inside and pass — not exploitable here, since
-#     anything able to plant such a symlink could read the target
-#     directly, but worth noting.
-#   CLAUDE.md still asks the model to respect the spirit of the rule
-#   for cases this script can't see into.
+# All three run against the command and against every script extracted
+# from a wrapper (`sh -c '<script>'`, `env <cmd>`, …), each scanned as
+# its own top-level command. See Phase 16 in HISTORY.md.
 #
-# SECOND RULE — .env PATHS:
-#   settings.json denies `Read(./.env*)` and `Read(./**/.env*)`, but those
-#   bind only the Read tool; a subprocess like `cat .env` or
-#   `grep KEY .env.local` reaches the same files unimpeded. The check at the
-#   bottom of this file mirrors those globs for Bash, so the deny is
-#   mechanical rather than a matter of the model honoring CLAUDE.md.
+# KNOWN LIMITS (defense-in-depth, not a fortress). Not seen:
+#   - paths inside command substitutions, `cat $(cmd)`
+#   - paths inside interpreter literals, `python3 -c 'open("/etc/x")'` —
+#     an interpreter's body isn't shell syntax, so it isn't unwrapped
+#   - paths built from env vars set in the same command
+#   - wrapper scripts assembled at run time, or nested past depth 4
+#   - arguments containing regex metacharacters (`|()[]^$\+`), skipped
+#     as patterns so `grep -E '...|/private/tmp|...'` doesn't
+#     false-positive; a real path containing one is skipped too
+#   - inbound symlinks: `/tmp/foo -> <project>/secret` resolves inside
+#     and passes. Outbound links are blocked, including a project-local
+#     link to a vendored tree outside the project.
+# CLAUDE.md asks the model to respect the rule where this can't see.
 #
-#   Heuristic: reject any argument with a path component starting with `.env`.
-#   Matches the Read globs exactly, so committed `.env*` templates are blocked
-#   too; a template meant to stay readable is named so it does not start with
-#   `.env` (e.g. `foo.env.example`).
-#
-#   Blocks path REFERENCES, not just reads: cheaper than enumerating which
-#   subcommands read content. A script that loads a .env internally is
-#   unaffected — the path never appears on the command line.
+# FAILS CLOSED: an analysis error, or a settings.json that won't parse,
+# blocks the call.
 
 set -euo pipefail
 
@@ -207,6 +198,7 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 payload=$(cat)
+project="${CLAUDE_PROJECT_DIR:-$PWD}"
 
 cmd=$(printf '%s' "$payload" | python3 -c '
 import json, sys
@@ -219,75 +211,212 @@ print(d.get("tool_input", {}).get("command", ""))
 
 [ -z "$cmd" ] && exit 0
 
-project="${CLAUDE_PROJECT_DIR:-$PWD}"
-project_real=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$project")
+set +e
+verdict=$(python3 - "$cmd" "$project" 2>&1 <<'PY'
+import json, os, re, shlex, sys
 
-violations=$(python3 - "$cmd" "$project_real" <<'PY'
-import os, re, shlex, sys
-cmd, project = sys.argv[1], sys.argv[2]
+cmd = sys.argv[1]
+project_real = os.path.realpath(sys.argv[2])
 
-# Allow-list: commands whose first word is one of these get pass-through.
-# These don't read file content; they manipulate paths or report metadata.
+if not cmd.strip():
+    sys.exit(0)
+
+
+def newlines_to_separators(text):
+    """Turn unquoted newlines into `;`.
+
+    A newline ends a command in shell, but shlex treats it as ordinary
+    whitespace, which would flatten a two-line command into one segment.
+    Newlines inside quotes are left alone — there they are data.
+    """
+    out = []
+    quote = None
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and i + 1 < len(text) and quote != "'":
+            out.append(c)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+            out.append(c)
+        elif c in ("'", '"'):
+            quote = c
+            out.append(c)
+        elif c == "\n":
+            out.append(" ; ")
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+# --------------------------------------------------------------------
+# Tokenizing
+#
+# `punctuation_chars=True` splits shell operators into their own tokens
+# even without surrounding whitespace, so `cat /etc/passwd|head` yields
+# ['cat', '/etc/passwd', '|', 'head'] and the path reaches the scan
+# instead of being dropped as one metacharacter-bearing token. Quoted
+# args (`grep -E 'a|b'`) stay grouped, so the REGEX_META skip still
+# applies. On malformed quoting, fall back to the raw string.
+# --------------------------------------------------------------------
+def tokenize(text):
+    text = newlines_to_separators(text)
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        return [text]
+
+
+# --------------------------------------------------------------------
+# Segmenting
+#
+# Every rule below judges commands one at a time: a safe first word
+# vouches for its own command only, never for what follows it.
+#
+# A token is a separator only if made ENTIRELY of operator characters,
+# which keeps `;`, `&&`, `|`, `>>` while leaving a quoted regex `a|b`
+# intact. Redirections separate too, so in `echo hi > /etc/passwd` the
+# `echo` cannot vouch for the path after the `>`.
+# --------------------------------------------------------------------
+SEP_CHARS = set(";&|<>()")
+
+
+def segments(tokens):
+    out, cur = [], []
+    for tok in tokens:
+        if tok and set(tok) <= SEP_CHARS:
+            if cur:
+                out.append(cur)
+                cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def first_word(tokens):
+    """First token, skipping leading VAR=value assignments."""
+    for tok in tokens:
+        if "=" in tok and not tok.startswith("="):
+            continue
+        return tok
+    return ""
+
+
+# --------------------------------------------------------------------
+# Wrapper unwrapping
+#
+# Every shell has a "run this string as a command" flag, so each
+# SHELL_WRAPPERS entry carries its script as the argument to a
+# `-c`-bearing flag (`-c`, `-ic`, `-lc`, `-Command`). The search runs to
+# the end of the arguments — needed to reach the flag in
+# `bash -o pipefail -c` and `busybox sh -c`. It may lift a non-script
+# token, which then gets scanned as a command: strictness, never a miss.
+#
+# RUNNER_WRAPPERS take their command as trailing arguments, after flags
+# and VAR=value assignments.
+#
+# Interpreters (`python3 -c`, `perl -e`) are excluded: their body isn't
+# shell syntax.
+# --------------------------------------------------------------------
+SHELL_WRAPPERS = {
+    "sh", "bash", "zsh", "dash", "ksh", "ksh93", "mksh",
+    "fish", "csh", "tcsh", "ash", "busybox",
+    "pwsh", "powershell",
+}
+RUNNER_WRAPPERS = {
+    "env", "nohup", "timeout", "nice", "ionice", "stdbuf", "setsid",
+    "command", "builtin", "exec", "script", "time", "xargs",
+    "sudo", "doas", "su",
+}
+
+MAX_DEPTH = 4
+
+
+def is_script_flag(tok):
+    """True for the flag whose argument is a script: -c, -ic, -Command."""
+    if not tok.startswith("-") or tok == "--":
+        return False
+    low = tok.lower()
+    if low in ("-command", "--command"):
+        return True
+    return not low.startswith("--") and low.endswith("c")
+
+
+def unwrap(text, depth=0, out=None):
+    """Collect scripts carried inside shell/runner wrappers, recursively."""
+    if out is None:
+        out = []
+    if depth >= MAX_DEPTH:
+        return out
+    toks = tokenize(text)
+    i = 0
+    while i < len(toks):
+        base = toks[i].rsplit("/", 1)[-1]
+        if base in SHELL_WRAPPERS:
+            j = i + 1
+            while j < len(toks):
+                if is_script_flag(toks[j]) and j + 1 < len(toks):
+                    inner = toks[j + 1]
+                    out.append(inner)
+                    unwrap(inner, depth + 1, out)
+                    break
+                j += 1
+        elif base in RUNNER_WRAPPERS:
+            j = i + 1
+            while j < len(toks):
+                a = toks[j]
+                if a.startswith("-") or ("=" in a and not a.startswith("=")):
+                    j += 1
+                    continue
+                break
+            rest = toks[j:]
+            if rest:
+                inner = " ".join(rest)
+                out.append(inner)
+                unwrap(inner, depth + 1, out)
+        i += 1
+    return out
+
+
+# Dedupe while preserving order: a runner followed by a shell
+# (`env sh -c '<script>'`) reaches the same script by two routes.
+inner_scripts = []
+for script in unwrap(cmd):
+    if script not in inner_scripts:
+        inner_scripts.append(script)
+variants = [cmd] + inner_scripts
+
+# ====================================================================
+# Rule 1 — project boundary
+# ====================================================================
+
+# Commands whose first word is one of these get pass-through. They
+# don't read file content; they manipulate paths or report metadata.
 SAFE_FIRST_WORDS = {
     "realpath", "basename", "dirname",
     "which", "type", "command",
     "echo", "printf", "true", "false", "test", "[",
 }
 
-# Strip leading env assignments (FOO=bar baz=qux cmd ...) to find the
-# actual command name.
-work = cmd.strip()
-first = ""
-while work:
-    head = work.split(None, 1)[0]
-    if "=" in head and not head.startswith("="):
-        rest = work.split(None, 1)
-        work = rest[1] if len(rest) > 1 else ""
-        continue
-    first = head
-    break
-
-if first in SAFE_FIRST_WORDS:
-    sys.exit(0)
-
 # Regex / glob metacharacters that real filesystem paths almost never
 # contain. If a whole shell argument contains any of these, the
 # argument is treated as a pattern (regex / glob / alternation), not as
-# something that bears a file path, and is skipped before path
-# extraction. Catches the common false positive where a `grep -E`
-# pattern contains a `/`-prefixed substring.
+# something bearing a file path, and is skipped before path extraction.
+# Catches the common false positive where a `grep -E` pattern contains
+# a `/`-prefixed substring.
 REGEX_META = set("|()[]^$\\+")
 
-# Shell-tokenize first. `punctuation_chars=True` splits shell operators
-# (`|`, `;`, `&`, `<`, `>`, `(`, `)`) into their own tokens even when
-# they're not surrounded by whitespace, so `cat /etc/passwd|head`
-# tokenizes to ['cat', '/etc/passwd', '|', 'head'] rather than
-# ['cat', '/etc/passwd|head'] — closing the no-space-pipe bypass that
-# previously let the REGEX_META skip drop the whole argument.
-# Quoted regex args (e.g. `grep -E 'a|b'`) stay grouped, so the
-# metacharacter skip below still applies to them.
-# On malformed quoting, fall back to scanning the raw command — the
-# strict path; better than silently passing.
-try:
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-    lex.whitespace_split = True
-    shell_args = list(lex)
-except ValueError:
-    shell_args = [cmd]
-
-# Find tokens that look like paths: start with /, ~, or ./, at a word
-# boundary (start of string or preceded by whitespace / shell separator).
-pattern = re.compile(
-    r"(?:(?<=^)|(?<=[\s=:|;<>&(]))((?:~|/|\./)[^\s'\"<>|;&)]+)"
-)
-tokens = []
-for arg in shell_args:
-    if any(c in arg for c in REGEX_META):
-        continue
-    tokens.extend(pattern.findall(arg))
-
-# Allow-list: kernel devices and special files. Not real filesystem reads;
-# reading/writing them leaks nothing about project layout. Common in
+# Kernel devices and special files. Not real filesystem reads; reading
+# or writing them leaks nothing about project layout. Common in
 # `2>/dev/null`, `< /dev/stdin`, etc.
 SAFE_PATHS = {
     "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr",
@@ -304,82 +433,165 @@ SAFE_PATH_PREFIXES = (
     # "/private/tmp/claude-",
 )
 
-bad = []
-for tok in tokens:
-    tok_clean = tok.rstrip(",;)]'\"")
-    if not tok_clean:
-        continue
-    if tok_clean in SAFE_PATHS:
-        continue
-    expanded = os.path.expanduser(tok_clean)
-    try:
-        abs_path = os.path.realpath(expanded)
-    except Exception:
-        abs_path = os.path.abspath(expanded)
-    if abs_path == project or abs_path.startswith(project + os.sep):
-        continue
-    if any(abs_path.startswith(p) for p in SAFE_PATH_PREFIXES):
-        continue
-    bad.append((tok_clean, abs_path))
-
-for tok, abs_path in bad:
-    print(f"{tok}\t{abs_path}")
-PY
+PATH_TOKEN = re.compile(
+    r"(?:(?<=^)|(?<=[\s=:|;<>&(]))((?:~|/|\./)[^\s'\"<>|;&)]+)"
 )
 
-if [ -n "$violations" ]; then
-    echo "BLOCKED by deny-bash-outside-project.sh: command references path(s) outside project" >&2
-    echo "Project: $project_real" >&2
-    echo "Outside-project tokens:" >&2
-    printf '%s\n' "$violations" | while IFS=$'\t' read -r token resolved; do
-        echo "  $token  ->  $resolved" >&2
-    done
-    echo >&2
-    echo "If this lookup is genuinely needed, ask the user; do not retry without their say-so." >&2
-    exit 2
-fi
 
-# ---------------------------------------------------------------------------
-# .env guard — Bash mirror of settings.json `Read(./**/.env*)`
+boundary_hits = []
+for variant in variants:
+    for seg in segments(tokenize(variant)):
+        if first_word(seg) in SAFE_FIRST_WORDS:
+            continue
+        for arg in seg:
+            if any(c in arg for c in REGEX_META):
+                continue
+            for tok in PATH_TOKEN.findall(arg):
+                tok_clean = tok.rstrip(",;)]'\"")
+                if not tok_clean or tok_clean in SAFE_PATHS:
+                    continue
+                expanded = os.path.expanduser(tok_clean)
+                try:
+                    abs_path = os.path.realpath(expanded)
+                except Exception:
+                    abs_path = os.path.abspath(expanded)
+                if abs_path == project_real or abs_path.startswith(project_real + os.sep):
+                    continue
+                if any(abs_path.startswith(p) for p in SAFE_PATH_PREFIXES):
+                    continue
+                if (tok_clean, abs_path) not in boundary_hits:
+                    boundary_hits.append((tok_clean, abs_path))
+
+if boundary_hits:
+    print("BLOCKED by deny-bash-outside-project.sh: command references path(s) outside project")
+    print("Project: %s" % project_real)
+    print("Outside-project tokens:")
+    for tok, abs_path in boundary_hits:
+        print("  %s  ->  %s" % (tok, abs_path))
+    print("")
+    print("If this lookup is genuinely needed, ask the user; do not retry without their say-so.")
+    sys.exit(2)
+
+# ====================================================================
+# Rule 2 — .env paths (Bash mirror of settings.json Read(./**/.env*))
 #
-# Independent of the boundary scan above on purpose: this one applies to
-# in-project paths (which the scan deliberately allows) and does NOT skip
-# regex-looking arguments, since a secrets guard should err toward refusing.
-# ---------------------------------------------------------------------------
-env_hits=$(python3 - "$cmd" <<'PY'
-import shlex, sys
+# Independent of rule 1: applies to IN-project paths, which rule 1
+# allows by design, and does not skip regex-looking arguments — a
+# secrets guard should err toward refusing. Matches on path COMPONENTS,
+# so `a/b/.env.local` is caught while `--env-file` and `environment`
+# are not, tracking the Read glob exactly. That includes a committed
+# `.env.example`; name a readable template so it does not lead with
+# `.env` (e.g. `foo.env.example`).
+#
+# Blocks path references, not reads. A script that loads a .env
+# internally is unaffected — keeping the VALUES out of the transcript
+# is the program's job, not this hook's.
+# ====================================================================
+env_hits = []
+for variant in variants:
+    for arg in tokenize(variant):
+        if any(part.startswith(".env") for part in arg.split("/")):
+            if arg not in env_hits:
+                env_hits.append(arg)
 
-cmd = sys.argv[1]
+if env_hits:
+    print("BLOCKED by deny-bash-outside-project.sh: command references a .env* path")
+    print("settings.json denies Read(./**/.env*); this mirrors that deny for Bash,")
+    print("so secrets are not reachable via cat/grep/python/etc.")
+    print("Matched token(s):")
+    for tok in env_hits:
+        print("  %s" % tok)
+    print("")
+    print("Do not work around this. If the operation is genuinely needed, ask the user to run it.")
+    sys.exit(2)
 
-try:
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-    lex.whitespace_split = True
-    args = list(lex)
-except ValueError:
-    args = [cmd]
+# ====================================================================
+# Rule 3 — command denies inside wrappers
+#
+# Sources merge in the order Claude Code merges them; deny is additive,
+# so order only affects which file gets named in the message.
+# ====================================================================
+if inner_scripts:
+    deny_specs = []
+    for path in (
+        os.path.join(project_real, ".claude", "settings.json"),
+        os.path.join(project_real, ".claude", "settings.local.json"),
+        os.path.join(os.path.expanduser("~"), ".claude", "settings.json"),
+    ):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as fh:
+                cfg = json.load(fh)
+        except Exception:
+            print("BLOCKED by deny-bash-outside-project.sh: cannot parse %s" % path)
+            print("The hook re-enforces this file's Bash denies inside subshells and")
+            print("refuses to run while it is unreadable. Fix the JSON, then retry.")
+            sys.exit(2)
+        perms = cfg.get("permissions") or {}
+        for entry in perms.get("deny") or []:
+            if isinstance(entry, str) and entry.startswith("Bash(") and entry.endswith(")"):
+                spec = entry[5:-1].strip()
+                if spec and spec not in deny_specs:
+                    deny_specs.append(spec)
 
-hits = []
-for arg in args:
-    # Match on path COMPONENTS so `a/b/.env.local` is caught while
-    # `--env-file` and `environment` are not. Mirrors the `.env*` glob.
-    if any(part.startswith(".env") for part in arg.split("/")):
-        hits.append(arg)
+    def matched_deny(seg):
+        # Drop leading VAR=value assignments, then compare the rest of
+        # the segment against each deny spec.
+        rest = list(seg)
+        while rest and "=" in rest[0] and not rest[0].startswith("="):
+            rest.pop(0)
+        norm = " ".join(" ".join(rest).split())
+        if not norm:
+            return None
+        for spec in deny_specs:
+            if spec.endswith(":*"):
+                pre = " ".join(spec[:-2].split())
+                if not pre:
+                    continue
+                if norm == pre:
+                    return spec
+                if norm.startswith(pre):
+                    # A prefix ending in a word character must be
+                    # followed by a space, so `curl` does not match
+                    # `curlopts`. One ending in punctuation (`rm -rf /`)
+                    # matches directly, as the deny glob intends.
+                    if not pre[-1].isalnum() or norm[len(pre):].startswith(" "):
+                        return spec
+            elif " ".join(spec.split()) == norm:
+                return spec
+        return None
 
-for h in dict.fromkeys(hits):
-    print(h)
+    deny_hits = []
+    for script in inner_scripts:
+        for seg in segments(tokenize(script)):
+            spec = matched_deny(seg)
+            if spec:
+                piece = " ".join(seg)
+                if (piece, spec) not in deny_hits:
+                    deny_hits.append((piece, spec))
+
+    if deny_hits:
+        print("BLOCKED by deny-bash-outside-project.sh: denied command inside a shell wrapper")
+        print("A wrapper such as `sh -c` / `zsh -ic` hides the real command from the")
+        print("harness's own deny matcher, which only sees the outer first word.")
+        print("Matched against settings.json:")
+        for piece, spec in deny_hits:
+            print("  %s   <-  Bash(%s)" % (piece, spec))
+        print("")
+        print("Run the command directly instead of through a wrapper. If the wrapper")
+        print("exists only to reach a version-manager toolchain (nvm, pyenv, rbenv),")
+        print("set PATH in .claude/settings.json `env` instead — see the README.")
+        sys.exit(2)
+
+sys.exit(0)
 PY
 )
+rc=$?
+set -e
 
-if [ -n "$env_hits" ]; then
-    echo "BLOCKED by deny-bash-outside-project.sh: command references a .env* path" >&2
-    echo "settings.json denies Read(./**/.env*); this mirrors that deny for Bash," >&2
-    echo "so secrets are not reachable via cat/grep/python/etc." >&2
-    echo "Matched token(s):" >&2
-    printf '%s\n' "$env_hits" | while IFS= read -r token; do
-        echo "  $token" >&2
-    done
-    echo >&2
-    echo "Do not work around this. If the operation is genuinely needed, ask the user to run it." >&2
+if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$verdict" >&2
     exit 2
 fi
 

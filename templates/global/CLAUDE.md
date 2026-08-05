@@ -16,5 +16,7 @@
 
 ## Security
 - Secrets live in `.env.*` only — never suggest committing them. Never echo `.env*` contents to the terminal.
+- **Package managers fetch and execute third-party code.** Prefer lockfile-respecting installs (`npm ci`, `pip install -r`); after any resolving install, check the lockfile diff and report unexpected upgrades.
+- **Don't route around a missing toolchain.** If `node`, `python` or similar isn't on PATH, say so and ask. Don't reach for `sh -c` / `zsh -ic` to borrow an interactive shell's environment.
 - Flag injection, XSS, exposed secrets, and credential leaks immediately.
 - **Prefer local tools over cloud services for working with project data.** CLI utilities, local databases, and on-machine processing keep data inside the project tree. Only reach for hosted analysis platforms (cloud notebooks, online viewers, paste services) when the user explicitly asks.

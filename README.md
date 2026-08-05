@@ -38,14 +38,20 @@ Here's what the four layers catch and what they don't protect against.
   with the documented adversarial-pattern caveat
 - Known secret paths: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`,
   `.env*`, `*.pem`, `*.key`
-- Claude-invoked network egress
-- Common destructive footguns
+- Claude-invoked network egress via HTTP CLIs and the web tools
+- Common destructive footguns, including worktree-discard commands
 - Configured tokens reaching git history
+- Commands laundered through a shell wrapper (`sh -c`, `zsh -ic`,
+  `env`, `xargs`)
+- Commands hidden behind a harmless one — `echo ok; cat /etc/hosts`,
+  a redirect target, or a second line — each command in a chain is
+  judged on its own
 
 ### Not protected (residual risk)
 
 - **Transcripts and file-history.** Written by the harness itself, not via the `Write` tool — hooks/denies are blind. Mitigations: disk encryption, periodic deletion, retention settings.
-- **Adversarial Bash patterns.** Paths inside `$(...)`, quoted script literals, or env-var-constructed. The Bash hook is heuristic.
+- **Adversarial Bash patterns.** Paths inside `$(...)`, quoted script literals, or env-var-constructed. The Bash hook is heuristic. Shell wrappers are now unwrapped (see [Layer 3](#layer-3--hooks-claude-time)), but only when the inner script is written inline — one assembled at run time stays invisible.
+- **Package managers as an egress and code-execution channel.** `npm`, `npx`, `pip`, `go`, `cargo`, `gh` are not denied — denying them would block ordinary work. Each fetches remote code and runs its install scripts with your privileges, and several can upload (`npm publish`, `gh pr create`). A resolving install (`npm install` rather than `npm ci`) can also pull in far more than asked: in the session behind Phase 16, adding one package moved a transitive dependency sixty minor versions inside its caret range and broke three untouched files. Layer 1 asks for lockfile-respecting installs and a lockfile-diff check; nothing enforces it.
 - **Symlinks into the project from outside.** A symlink at `/tmp/foo` → `<project>/secret` resolves as in-project. Hole in the abstraction, not exploitable by the model alone.
 - **Subprocess-initiated I/O.** A Python/Node script started by Claude inherits process privileges; a poisoned dependency bypasses Layers 2–3. Needs OS-level isolation (container with `--network=none`).
 - **Inference itself + provider-side retention.** Every turn reaches Anthropic; Pro/Max has no Zero Data Retention.
@@ -63,7 +69,7 @@ project:
 |---|---|---|---|
 | 1 | **Prompt** | `CLAUDE.md` (global + project) | Posture-setting and rules the harness layers can't express; advisory |
 | 2 | **Permissions** | `.claude/settings.json` `permissions.deny` | Reads from outside the project tree, network-egress tools (`WebFetch`/`WebSearch`/`curl`/`wget`/`nc`), destructive shell, writes into `~/.claude/**` (auto-memory, plan mode) and the `/tmp` family |
-| 3 | **Hooks (Claude-time)** | Two `PreToolUse` hooks: one for `Write\|Edit\|NotebookEdit\|Read`, one for `Bash` | Generic catch for what the static patterns missed — enforces the project boundary on every file-path-bearing tool call (Read, Write, Edit, NotebookEdit) plus every Bash command, via `realpath` against `$CLAUDE_PROJECT_DIR` |
+| 3 | **Hooks (Claude-time)** | Two `PreToolUse` hooks: one for `Write\|Edit\|NotebookEdit\|Read`, one for `Bash` | Generic catch for what the static patterns missed — enforces the project boundary on every file-path-bearing tool call (Read, Write, Edit, NotebookEdit) plus every Bash command, via `realpath` against `$CLAUDE_PROJECT_DIR`; also re-applies Layer 2's Bash denies inside shell wrappers, where the harness matcher can't see them |
 | 4 | **Hooks (git-time)** | `.githooks/pre-commit` with project-specific token regexes | Tokens or identifiers carried in source data reaching a public commit |
 
 Layers 2–4 cost zero tokens per turn; Layer 1 carries only the
@@ -204,6 +210,26 @@ the running profile signals the gap afterwards — the only place it
 shows is in the diff. Treat diffs to `.claude/` and `.githooks/` the
 same way you'd treat a change to auth code.
 
+### Updating a project scaffolded earlier
+
+Scaffolded projects carry their own copies of the hook scripts and deny
+list — nothing propagates to them when this repo changes. A project set
+up before a given phase keeps that phase's gap until you re-sync it,
+and nothing in the running session signals the difference.
+
+```bash
+cd <existing-project>
+cp <this-repo>/templates/project/.claude/hooks/*.sh .claude/hooks/
+chmod +x .claude/hooks/*.sh
+diff <this-repo>/templates/project/.claude/settings.json .claude/settings.json
+```
+
+Merge the deny list by hand rather than overwriting — a project that has
+deliberately relaxed a pattern shouldn't have it silently restored. Then
+restart Claude (hooks register at session start) and re-run the
+[sanity test](#first-launch-sanity-test), paying attention to probes 6–7:
+a stale project passes 1–5 and is still open.
+
 ### Review the guardrails before first launch
 
 Open each of the following files and skim it before launching Claude
@@ -230,10 +256,17 @@ In a fresh `claude` session, ask the assistant to:
 3. Write to a file inside the project → succeeds
 4. `WebFetch https://example.com` → blocked
 5. `cat /etc/hosts` → blocked by Bash hook
-6. (If you uncommented a token pattern in `.githooks/pre-commit`)
+6. `sh -c 'cat /etc/hosts'` → blocked by the Bash hook's wrapper rule
+7. `sh -c 'printenv'` → blocked by the same rule, against the deny list
+8. (If you uncommented a token pattern in `.githooks/pre-commit`)
    stage a fake-token file and `git commit` → blocked
 
-If any of 1–5 don't behave: confirm hooks are `-rwxr-xr-x` and
+Probes 6–7 matter because they're the ones that fail *silently* if the
+hook is stale — they were allowed by every version of this profile
+before Phase 16, so a project scaffolded earlier and never re-synced
+will pass 1–5 and still be open.
+
+If any of 1–7 don't behave: confirm hooks are `-rwxr-xr-x` and
 restart Claude (hooks register at session start, not per-message).
 
 ## How it works
@@ -259,7 +292,12 @@ it fires. Categories included by default:
 - **Network egress**: `WebFetch`, `WebSearch`, `Bash(curl:*)`,
   `wget`, `nc`, `ssh`, `scp`, `rsync`
 - **Destructive shell**: `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)`,
-  `Bash(git push:*)`, `Bash(git reset --hard:*)`
+  `Bash(git push:*)`, `Bash(git reset --hard:*)`, plus the
+  worktree-discard family `Bash(git clean:*)`, `Bash(git restore:*)`,
+  `Bash(git checkout --:*)`, `Bash(git checkout .:*)` — all of which
+  throw away uncommitted work as irreversibly as `reset --hard` does.
+  `git stash` is deliberately *not* denied: it's recoverable, and it's
+  the standard way to test whether a failure predates your changes.
 - **Secret reads**: `Read(./.env*)`, `Read(./**/*.pem)`, `*.key` — these bind the Read tool only; the Bash hook separately mirrors the `.env*` globs so `cat`/`grep` can't reach them (the `*.pem`/`*.key` patterns have no Bash mirror yet)
 - **Cross-project reads**: `Read(../**)` (Read tool, parent-relative); the Bash hook covers absolute paths via `realpath` against `$CLAUDE_PROJECT_DIR`
 - **Outside-project writes**: `Write(~/.claude/**)` + Edit /
@@ -282,29 +320,61 @@ for all four tools — catches any outside-project write the deny list
 didn't enumerate, and closes the Read-tool gap left when `Read(~/**)`
 was removed (see HISTORY phase 13).
 
-**`deny-bash-outside-project.sh`** matches `Bash` and enforces two rules.
-The first is the project boundary: parses the command, extracts
-path-looking tokens (start with `/`, `~`, or `./`), realpath-resolves
-each, blocks anything outside the project. Has three allow-lists (safe
-first-words like `echo`/`realpath`, kernel devices like `/dev/null`,
-regex-pattern arguments via `shlex`) and one opt-in `SAFE_PATH_PREFIXES`
-that restores `run_in_background` at the cost of allowing reads under
-`/private/tmp/claude-*`. See the script header for the full lists.
+**`deny-bash-outside-project.sh`** matches `Bash` and enforces three rules.
 
-The second rule mirrors the Layer 2 `Read(./**/.env*)` deny for Bash.
-Layer 2's pattern binds only the Read tool, so `cat .env.local` reached
-in-project secrets that the boundary rule allows by design (see HISTORY
-phase 15). The guard rejects any argument with a path *component*
-starting with `.env` — catching `a/b/.env.local` while leaving
-`environment` and `--env-file` alone. It tracks the Read glob exactly,
-so a committed `.env.example` is blocked too; name templates meant to
-stay readable so they don't lead with `.env` (e.g. `foo.env.example`).
+*Rule 1 — the project boundary.* Splits the command line into its
+individual commands (on `;`, `&&`, `|`, redirections, and unquoted
+newlines), extracts path-looking tokens from each (start with `/`, `~`,
+or `./`), realpath-resolves them, and blocks anything outside the
+project. Has three allow-lists (safe first-words like `echo`/`realpath`,
+kernel devices like `/dev/null`, regex-pattern arguments via `shlex`)
+and one opt-in `SAFE_PATH_PREFIXES` that restores `run_in_background` at
+the cost of allowing reads under `/private/tmp/claude-*`. See the script
+header for the full lists. The safe-first-word allowance applies per
+command, not per line — `echo ok; cat /etc/hosts` is two commands and
+the `echo` doesn't vouch for the `cat` (HISTORY phase 16).
+
+*Rule 2 — `.env` paths.* Mirrors the Layer 2 `Read(./**/.env*)` deny for
+Bash. Layer 2's pattern binds only the Read tool, so `cat .env.local`
+reached in-project secrets that the boundary rule allows by design (see
+HISTORY phase 15). The guard rejects any argument with a path
+*component* starting with `.env` — catching `a/b/.env.local` while
+leaving `environment` and `--env-file` alone. It tracks the Read glob
+exactly, so a committed `.env.example` is blocked too; name templates
+meant to stay readable so they don't lead with `.env`
+(e.g. `foo.env.example`). Note what this does *and doesn't* protect: it
+blocks path **references**, so a script that loads a `.env` internally
+runs fine — keeping the **values** out of the transcript once loaded is
+the program's job (redact before printing), not the hook's.
+
+*Rule 3 — denied commands inside wrappers.* Every shell has a "run this
+string as a command" flag — `sh -c`, `bash -o pipefail -c`, `zsh -ic`,
+`busybox sh -c`, `pwsh -Command`. The script arrives as one quoted
+argument, so the harness matches its denies against the outer first
+word and rules 1 and 2 see a single opaque token. That voided the whole
+Bash side of the profile (HISTORY phase 16).
+
+The hook now recursively extracts inner scripts from those shells and
+from runner prefixes (`env`, `xargs`, `nohup`, `command`, `sudo`, …),
+scans each as its own top-level command, and re-applies the `Bash(...)`
+deny entries to them. Those entries are read from `settings.json` at
+run time rather than restated, so the hook can't drift from the list it
+re-enforces.
+
+Interpreters are **not** unwrapped: the body of `python3 -c`, `perl -e`
+or `node -e` isn't shell syntax, so parsing it as shell would be wrong.
+Paths inside those bodies remain a documented limit.
+
+The hook **fails closed**: an internal error, or a `settings.json` that
+doesn't parse, blocks the call rather than passing it.
 
 This is **defense-in-depth, not a fortress**. Paths inside command
-substitutions (`cat $(cmd)`), inside quoted script literals
-(`python3 -c 'open("/etc/x")'`), or constructed via env vars set
-in the same line will leak through. The Layer 1 prompt asks the
-model to respect spirit-of-the-law for those.
+substitutions (`cat $(cmd)`), inside interpreter script literals
+(`python3 -c 'open("/etc/x")'` — an interpreter's `-c` body isn't shell
+syntax, so it isn't unwrapped), or constructed via env vars set in the
+same line will leak through. Wrapper unwrapping is bounded at depth 4
+and only sees scripts written inline. The Layer 1 prompt asks the model
+to respect spirit-of-the-law for the rest.
 
 ### Layer 4 — Hook (git-time)
 
@@ -354,6 +424,42 @@ Common classes below — token formats might change over time, so it's better to
 The right list is whatever the project's *data* would expose if
 committed by accident.
 
+### Version-manager toolchains (nvm, pyenv, rbenv, asdf)
+
+Set this up **before** the first session on any project whose toolchain
+comes from a version manager. Version managers initialise from
+`~/.zshrc` or `~/.bashrc`, which only interactive shells read. The Bash
+tool doesn't get one, so `node`, `npm`, `python` and `ruby` are absent
+from `PATH`, and the agent can't run tests or builds. The obvious
+workaround is `zsh -ic '<cmd>'` — a shell wrapper, which before the
+Phase 16 fix silently voided every Bash rule in the profile. It's now
+blocked when it carries a denied command, and it sources rc files from
+outside the project either way.
+
+The fix is to put the toolchain on `PATH` directly, so no wrapper is
+ever needed. Add an `env` block to `.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "PATH": "/Users/<you>/.nvm/versions/node/v20.17.0/bin:/usr/local/bin:/usr/bin:/bin"
+  },
+  "permissions": { "deny": [ "..." ] }
+}
+```
+
+Find the right prefix with `dirname "$(which node)"` in your own
+terminal. Two caveats: the version is pinned in the path, so this
+needs updating when you switch runtimes (`asdf` and `pyenv` shims
+directories are more stable, since the shim path doesn't encode the
+version); and because `settings.json` is committed, a machine-specific
+absolute path belongs in `.claude/settings.local.json` instead if the
+repo has other contributors.
+
+Same principle as [Relaxing denies](#relaxing-denies-for-a-project-that-legitimately-needs-them)
+below: decide once, in the file that owns it, rather than leaving the
+agent to improvise.
+
 ### Relaxing denies for a project that legitimately needs them
 
 Some projects will hit a deny that's blocking legitimate work — a
@@ -372,8 +478,9 @@ below to see which is which before removing anything.
 | `Read(../**)` + the `Bash` PreToolUse hook | Path 3 — cross-project reads of any other project on the machine | **high (privacy)** |
 | `Write(~/.claude/**)` family | Persistent shared state (auto-memory, plan files) carrying project context across sessions and projects | **medium (privacy)** |
 | Background-task opt-in (`SAFE_PATH_PREFIXES` in the Bash hook) | Reads from anything any process writes under `/private/tmp/claude-*`. Restores `run_in_background`. | **medium (read surface)** |
+| Wrapper unwrapping (rule 3 in the Bash hook) | Path 2 + 3 — any denied command becomes reachable again as `sh -c '<it>'`, and the boundary and `.env` rules stop reaching inside wrappers | **high (voids the Bash side wholesale)** |
 | `Bash(git push:*)` | Removes the manual-push speed bump | **low (undo cost)** |
-| `Bash(git reset --hard:*)` | Lost local work if the model misuses it | **low (undo cost)** |
+| `Bash(git reset --hard:*)`, `Bash(git clean:*)`, `Bash(git restore:*)`, `Bash(git checkout --:*)` | Lost local work if the model misuses them | **low (undo cost)** |
 | `Bash(rm -rf /:*)`, `Bash(rm -rf ~/:*)` | Catastrophic accidents | **low (no privacy cost; only blast radius)** |
 
 Two pieces of guidance that hold across all of them:
@@ -447,9 +554,9 @@ this repo, run the bundled regression test before publishing:
 bash tests/test_hooks.sh
 ```
 
-The suite runs in three layers (26 checks at time of writing; expects all green):
+The suite runs in three layers (83 checks at time of writing; expects all green):
 
-1. **Behaviour** — exercises the Bash hook against ten cases: the boring positives (in-project read allowed, outside-project read blocked), three regex/kernel-device false-positive shapes that have previously broken the hook, and four regression cases for the Phase 11 no-whitespace shell-operator bypass (`cat /etc/passwd|head`, `... ;...`, `... </...`, `(cat /etc/...)`).
+1. **Behaviour** — exercises the Bash hook against the boring positives (in-project read allowed, outside-project read blocked), three regex/kernel-device false-positive shapes that have previously broken the hook, four regression cases for the Phase 11 no-whitespace shell-operator bypass (`cat /etc/passwd|head`, `... ;...`, `... </...`, `(cat /etc/...)`), the Phase 15 `.env` guard including its two deliberate non-matches, and the Phase 16 cases: command-chaining (`echo one; cat /etc/hosts`, redirect targets, unquoted newlines) and shell wrappers — one block proving the boundary and `.env` rules reach inside `sh -c` / `zsh -ic`, one proving denied commands can't be laundered through a wrapper, one proving the legitimate toolchain use (`zsh -ic 'npx vitest run'`) still passes, and one proving an unparseable `settings.json` fails closed. Plus three cases against the file-path hook.
 2. **Drift** — verifies that the heredoc bodies inside `newproj-safe` match the standalone template files in `templates/project/` byte-for-byte. Catches "edited one, forgot to update the other."
 3. **Invariants** — JSON validity for every shipped `settings.json`, executability for every hook script, a **forbidden-patterns** assertion (entries we deliberately removed and never want to see reintroduced — currently `Read(~/**)` with the Phase 13 reason inline), and a **required-patterns** assertion (audit-driven additions like `Bash(history:*)` and the key-file globs that would be load-bearing losses if silently dropped).
 

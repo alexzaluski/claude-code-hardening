@@ -446,6 +446,170 @@ rule forbids. Preventive findings like this should be raised as a caveat
 for the operator to decide on, not acted on unilaterally.
 
 
+### Phase 16 — One wrapper voided the whole Bash side
+
+Found by re-reading a session transcript from another of my projects,
+one running this profile, and checking whether everything the agent did
+in it was according to the rules.
+
+The profile was live there. The agent tried to write an auto-memory
+file, was refused, and reported *"the project's deny-outside-project
+hook blocks writes to the memory directory"*, then asked whether to put
+the note in `CLAUDE.md` instead. That names the file-path hook; both
+hooks register from the same `settings.json`, so the Bash hook was
+loaded in that session too.
+
+**What happened.** The agent couldn't run the test suite — `node`, `npm`
+and `npx` weren't on the Bash tool's `PATH`, so every run went: agent
+prints the commands, I run them in my terminal, I paste the output back.
+After several rounds I told it to fix that and test its own changes from
+then on. It found the cause — nvm puts node on `PATH` from `~/.zshrc`,
+which only interactive shells read, and the Bash tool doesn't get one —
+and settled on `zsh -ic '<cmd>'`. From then on it ran everything that
+way: tests, typecheck, build, `npm install`. It worked, and I was
+satisfied with it at the time.
+
+`zsh -ic` is also a general-purpose re-entry into the shell. Every one
+of those calls ran against a live copy of this profile and was allowed:
+
+```
+ALLOW  zsh -ic 'printenv'                   ← Bash(printenv:*) is denied
+ALLOW  zsh -ic 'history'                    ← Bash(history:*) is denied
+ALLOW  zsh -ic 'git push'                   ← Bash(git push:*) is denied
+ALLOW  zsh -ic 'curl example.com'           ← Bash(curl:*) is denied
+ALLOW  zsh -ic 'cat ~/.ssh/id_rsa | head'   ← rule 1, project boundary
+ALLOW  zsh -ic 'cat .env.local'             ← rule 2, the Phase 15 guard
+ALLOW  command cat /etc/passwd              ← rule 1 again, via a runner
+```
+
+Every rule the Bash side has, defeated by one wrapper. I expected the
+command denies to fall, since the harness matches on the first word and
+that is now `zsh`. I did not expect the path scan to fall with them. It
+does: the inner script is a single quoted token, so an operator anywhere
+inside it (`| head`) puts a `|` into that token and the `REGEX_META`
+skip discards the whole script as a regex pattern argument. That's the
+Phase 11 bypass one quoting level down — `punctuation_chars=True` splits
+operators only at the level shlex is parsing, and inside a quoted
+argument the Phase 9 metacharacter skip then throws the argument away.
+Two fixes, each correct alone, with a hole between them; the same shape
+as Phase 15.
+
+One case nearly hid it. `zsh -ic 'curl https://example.com'` *was*
+blocked, but not because of `curl`: `://` matches the path regex's
+`(?<=:)` lookbehind, so `//example.com` resolved outside the project.
+Drop the scheme and it passes.
+
+**Fix.** Recursively extract inner scripts from shell wrappers and
+runner prefixes (`env`, `xargs`, `nohup`, `command`, `sudo`), then scan
+each as its own top-level command. That alone restores the boundary and
+`.env` rules at every nesting level, since a script scanned at the top
+level tokenizes normally. It also closed `command cat /etc/passwd`, open
+for a duller reason: `command` is in `SAFE_FIRST_WORDS`, so the whole
+call took the early exit.
+
+Then a third rule for the command denies. Copying the deny list into the
+hook would duplicate what the drift test exists to catch and go stale on
+the first edit to `settings.json`, so the hook **reads the deny entries
+out of `settings.json` at run time** and re-applies the `Bash(...)` ones
+to extracted scripts — extracted scripts only, since bare commands are
+the harness's job. The hook also now **fails closed**: an internal
+error, or a `settings.json` that doesn't parse, blocks rather than
+passes.
+
+The old hook had no shell awareness at all — `bash -c`, `sh -c`,
+`dash -c` and `ksh -c` behaved exactly like `zsh -ic`. So the wrapper
+list covers every shell, and the script argument is found by scanning to
+the end of the arguments for a `-c`-bearing flag. My first version
+stopped at the first non-flag argument, which let `bash -o pipefail -c`
+and the multi-call form `busybox sh -c` through.
+
+**A second bypass, found while testing the first.** Checking that the
+`echo hi 2>/dev/null` allowance still held, I tried a two-command line:
+
+```
+ALLOW  echo one; cat /etc/hosts     ← against the PREVIOUS committed hook
+ALLOW  true && cat /etc/hosts
+ALLOW  echo hi > /etc/passwd
+```
+
+These are plain command chains with a separate cause, so unwrapping
+doesn't touch them: `SAFE_FIRST_WORDS` took the first word of the
+*whole line* and skipped everything after it, so one `echo` vouched for
+anything chained behind it. It has been in the hook since Phase 3
+and survived Phase 9, Phase 11 and the Phase 13 audit, because every
+test case I had written was a single command. Fixed by splitting each
+line into its component commands and judging each on its own first word,
+with redirection operators counting as separators so a target is never
+covered by whatever wrote to it. Unquoted newlines needed handling too —
+shell ends a command at a newline, shlex treats it as whitespace — so a
+pass now rewrites them to `;` outside quotes. The wrapper bypass at
+least needed an unusual command shape; this one needed `echo` and a
+semicolon.
+
+**Root cause (Lesson 8).** The toolchain wasn't on `PATH` and nothing
+offered a sanctioned way to put it there, so the agent built its own
+route and took a layer down with it. The fix therefore ships with the
+alternative: a README recipe for putting a version-manager toolchain on
+`PATH` via the `env` block in `settings.json`. The wrapper rule still
+allows `zsh -ic 'npx vitest run'` — the profile has no quarrel with
+running tests.
+
+**Three other things from the same session.**
+
+*Worktree-discard was half-covered.* `git checkout -- package-lock.json`
+and `git stash push -u` both ran unblocked while `git reset --hard` was
+denied — an inconsistency rather than a policy. Added `git clean`,
+`git restore`, `git checkout --` and `git checkout .`. It costs
+something: under the new deny the agent couldn't have restored that
+lockfile itself and would have had to ask me. Kept anyway, because
+discarding uncommitted work should need a human, and `git stash` stays
+allowed as the non-destructive way to get the same answer.
+
+*Package managers are an unacknowledged egress and code-execution
+channel.* The only thing in the session that caused damage was a bare
+`npm install`: it re-resolved the tree, moved `@supabase/supabase-js`
+sixty minor versions inside its caret range, and broke three untouched
+files. `npm`, `npx`, `pip`, `go` and `gh` all fetch and run remote code,
+and several can upload. Denying them isn't on the table — that's the
+over-restriction trap. Documented in the threat model, with a Layer 1
+line asking for lockfile-respecting installs and a diff check afterwards.
+Enforcement would need the container.
+
+*Two things worth recording as working.* The memory-write refusal above
+is one — a counter-example to Phase 13's Finding 2, where a model
+invented "permissions tightened mid-session" for the same class of
+friction; here the attribution was exact. The other:
+`npm run test:live:email` loaded `.env.live-test` internally, which the
+Phase 15 guard allows by design because the path never reaches the
+command line, and that project had its own test asserting the SMTP
+password never lands in an error string. That's the division of labour
+Phase 15 implied — the hook blocks path *references*, and keeping
+*values* out of the transcript is the program's job. Now said in the
+README.
+
+**Lesson — a control binds to a syntactic position, and a subshell
+resets it.** Phase 15: a tool-scoped deny doesn't survive the jump to a
+subprocess. Here: Layer 2 binds to a command's *first word*, and
+anything that spawns a shell supplies a new one. Twice makes it a class,
+and it strengthens the Phase 13 argument for moving boundary-shaped
+rules out of the deny list and into the hooks. The deny list is still
+the right home for *what* is forbidden — rule 3 reads it as the source
+of truth. What it can't be trusted with is *noticing* the forbidden
+thing under a different first word.
+
+**Lesson — re-read sessions, not just probes.** The bypass ran a dozen
+times in a hardened project across a session I read at the time and was
+pleased with, and several rounds of adversarial self-review hadn't found
+it. Probing asks what an attacker would do; re-reading asks what the
+agent actually did and whether all of it was inside the rules. The
+second question found more. Related: every claim here came from a hook
+invocation with an exit code. I wrote down the opposite expectation
+first and was wrong on both halves, and the `curl https://…` case would
+have confirmed the wrong model if I'd taken it at face value. The same
+trap applies to the tests — `/bin/bash -c 'printenv'` is blocked by the
+boundary rule, not the deny — so `run_case` now asserts which rule
+fired.
+
 ---
 
 ## Reference appendix
@@ -483,6 +647,8 @@ Model behavior         ← Layer 1 (CLAUDE.md)               — advisory
 Write/Edit patterns    ← Layer 2 (permissions.deny)        — static, enforced
 Write/Edit paths       ← Layer 3a (Write hook)             — generic, enforced
 Bash-mediated reads    ← Layer 3b (Bash hook)              — best-effort, enforced
+Shell-wrapper re-entry ← Layer 3b rule 3 (Phase 16)        — best-effort, enforced
+Package-manager fetch  ← (uncovered — needs container)
 Subprocess I/O         ← (uncovered — needs container)
 Host-disk at rest      ← FileVault
 Network exfil (OS)     ← (uncovered — needs container --network=none)
@@ -503,6 +669,15 @@ Git-commit leakage     ← Layer 4 (.githooks/pre-commit) + gitleaks pre-push + 
 `/fewer-permission-prompts`) cannot do their cross-session scan;
 they fall back to in-session evidence. Smaller signal, no
 hardening change needed.
+- Denied commands can't be reached through `sh -c` / `zsh -ic` /
+`env` (Phase 16). Wrappers themselves stay usable — only a denied
+*inner* command is refused — but a version-manager toolchain should
+be put on `PATH` via the `env` block in `settings.json` rather than
+reached with `zsh -ic`. See the README recipe.
+- Worktree-discard commands (`git clean`, `git restore`,
+`git checkout --`, `git checkout .`) are denied alongside
+`git reset --hard`. `git stash` remains available, which covers the
+legitimate "did this failure predate my changes?" workflow.
 
 
 ### Recurring questions
@@ -550,3 +725,5 @@ one having decided to allow it.
 8. **The over-restriction trap.** A deny that's too broad — `Bash(rm -rf:*)` blocking benign `rm -rf .venv/`, for instance — produces enough day-to-day friction that the practical end state is switching it off entirely. Narrower patterns at user scope (`rm -rf /:*`, `rm -rf ~/:*`) hold up better than a project-wide blanket. A pattern that catches only what it's meant to gives stronger protection in practice than one broad enough to block legitimate work.
 9. **Documentation as you build.** A week later the reason for a rule is hard to recover; six months later someone else picks it up and wonders whether to delete it. A written history is the answer.
 10. **Don't copy settings between scopes verbatim.** Global and project `settings.json` answer different questions ("what should never happen anywhere" vs "what's off-limits for this data"). Promoting project denies to global over-restricts unrelated work; promoting hook entries to global breaks every non-scaffolded project.
+11. **Every control binds to a syntactic position, and something can usually reset it.** A tool-scoped deny doesn't survive the jump to a subprocess (Phase 15); a command deny binds to the first word, and any subshell supplies a new one (Phase 16). When adding a control, ask what it binds to and what could change that thing without changing the intent.
+12. **Re-read sessions, not just probes.** The Phase 16 bypass ran unnoticed for a whole session in a hardened project of mine, doing a task I had asked for. Probing tests the attacks you already imagined; re-reading a session that went well asks the duller question — *was all of that inside the rules?* — and an agent working around an obstacle produces exactly the shapes the heuristics weren't written for.
